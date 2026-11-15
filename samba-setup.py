@@ -531,6 +531,15 @@ def setup_samba():
 # This is the default; change it from the menu: 4 Settings (saved in /etc/network-drive/settings.conf).
 WARN_AT_PERCENT = 85
 
+# Order of drives in the Storage panel (also changeable from 4 Settings).
+SORT_DRIVES = "name"
+SORT_OPTIONS = {                       # setting value → menu label
+    "name":     "Name (A → Z)",
+    "usage":    "Fullness (least → most full)",
+    "capacity": "Capacity (smallest → largest)",
+}
+SORT_SHORT = {"name": "name", "usage": "fullness", "capacity": "capacity"}
+
 # Storage bar style:
 #   "grid"   – thin gap between segments AND between drives (default, like abtop)
 #   "lines"  – ▇  thin gap between drives only; segments touch
@@ -609,27 +618,40 @@ def storage_panel():
     if extra > 0:
         lines = storage_lines(bar_width=24 + extra)
     print()
-    print(box(lines, title="Storage", color=BLUE))
+    print(box(lines, title=f"Storage · by {SORT_SHORT[SORT_DRIVES]}", color=BLUE))
 
 
 def storage_lines(bar_width=24):
     """Fill gauges for every data drive set up in fstab (None if there are none)."""
     fstab_uuids, _ = read_fstab()
-    mps = sorted({mp for mp in fstab_uuids.values() if mp.startswith("/") and mp not in SYSTEM_MOUNTS})
+    mps = {mp for mp in fstab_uuids.values() if mp.startswith("/") and mp not in SYSTEM_MOUNTS}
     if not mps:
         return None
     shares, _ = read_samba_shares()
-    rows = []
+
+    # Gather usage first, so the drives can be sorted by it.
+    mounted, unmounted = [], []
     for mp in mps:
-        name = trunc(os.path.basename(mp.rstrip("/")) or mp, 20)
-        net = f"{GREEN}● shared{RESET}" if mp.rstrip("/") in shares else f"{GRAY}○ local{RESET}"
         try:
             if not os.path.ismount(mp):
                 raise OSError
-            u = shutil.disk_usage(mp)
+            mounted.append((mp, shutil.disk_usage(mp)))
         except OSError:
-            rows.append([f"{GRAY}{name}{RESET}", f"{GRAY}not mounted{RESET}", "", "", net])
-            continue
+            unmounted.append(mp)
+
+    name_key = lambda mp: os.path.basename(mp.rstrip("/")).lower()
+    if SORT_DRIVES == "usage":        # least full → most full
+        mounted.sort(key=lambda d: (d[1].used / d[1].total if d[1].total else 0, name_key(d[0])))
+    elif SORT_DRIVES == "capacity":   # smallest → largest
+        mounted.sort(key=lambda d: (d[1].total, name_key(d[0])))
+    else:                             # name, A → Z
+        mounted.sort(key=lambda d: name_key(d[0]))
+    unmounted.sort(key=name_key)      # drives that aren't mounted always go last
+
+    rows = []
+    for mp, u in mounted:
+        name = trunc(os.path.basename(mp.rstrip("/")) or mp, 20)
+        net = f"{GREEN}● shared{RESET}" if mp.rstrip("/") in shares else f"{GRAY}○ local{RESET}"
         frac = u.used / u.total if u.total else 0
         # ⚠ marks drives at or above WARN_AT_PERCENT. Some terminals (Windows Terminal)
         # draw ⚠ two columns wide, so it always gets a spare space after it to spill into.
@@ -638,6 +660,10 @@ def storage_lines(bar_width=24):
         pct = f"{_pct_color(frac)}{frac * 100:.0f}%{mark} {RESET}"
         rows.append([f"{BOLD}{name}{RESET}", usage_bar(frac, bar_width), pct,
                      f"{human(u.used)} {GRAY}/{RESET} {human(u.total)}", net])
+    for mp in unmounted:
+        name = trunc(os.path.basename(mp.rstrip("/")) or mp, 20)
+        net = f"{GREEN}● shared{RESET}" if mp.rstrip("/") in shares else f"{GRAY}○ local{RESET}"
+        rows.append([f"{GRAY}{name}{RESET}", f"{GRAY}not mounted{RESET}", "", "", net])
     return table(["Drive", "Usage", "", "Used / Size", "Network"], rows,
                  ["<", "<", ">", ">", "<"])
 
@@ -840,18 +866,19 @@ SETTINGS_FILE = "/etc/network-drive/settings.conf"
 
 def load_settings():
     """Apply saved settings over the defaults above (missing/bad values are ignored)."""
-    global WARN_AT_PERCENT
+    global WARN_AT_PERCENT, SORT_DRIVES
     try:
         with open(SETTINGS_FILE) as f:
             for line in f:
                 key, sep, value = line.partition("=")
                 if not sep or line.lstrip().startswith("#"):
                     continue
-                if key.strip() == "warn_at_percent":
-                    n = int(value.strip())
-                    if 1 <= n <= 100:
-                        WARN_AT_PERCENT = n
-    except (OSError, ValueError):
+                key, value = key.strip(), value.strip()
+                if key == "warn_at_percent" and value.isdigit() and 1 <= int(value) <= 100:
+                    WARN_AT_PERCENT = int(value)
+                elif key == "sort_drives" and value in SORT_OPTIONS:
+                    SORT_DRIVES = value
+    except OSError:
         pass
 
 
@@ -860,44 +887,72 @@ def save_settings():
     with open(SETTINGS_FILE, "w") as f:
         f.write("# Network Drive settings. Change them from the tool's Settings menu.\n")
         f.write(f"warn_at_percent = {WARN_AT_PERCENT}\n")
+        f.write(f"sort_drives = {SORT_DRIVES}\n")
     os.chmod(SETTINGS_FILE, 0o644)
 
 
-def settings_menu():
+def _save_and_report(message):
+    try:
+        save_settings()
+        ok(f"{message} {GRAY}(saved to {SETTINGS_FILE}){RESET}")
+    except OSError as e:
+        fail(f"Couldn't save settings: {e}. The change lasts until you quit.")
+    print()
+    storage_panel()              # show the result right away
+
+
+def set_warning_level():
     global WARN_AT_PERCENT
+    print(f"\n  {GRAY}Drives this full or fuller get a warning sign next to their percentage.{RESET}")
+    while True:
+        ans = ask("Warn when a drive reaches what percent? (1–100)", str(WARN_AT_PERCENT)).rstrip("%").strip()
+        if not ans.isdigit():
+            fail("Enter a whole number, like 85.")
+        elif not 1 <= int(ans) <= 100:
+            fail("Enter a number from 1 to 100.")
+        else:
+            break
+    old, WARN_AT_PERCENT = WARN_AT_PERCENT, int(ans)
+    _save_and_report(f"Warning set to {BOLD}{WARN_AT_PERCENT}%{RESET} {GRAY}(was {old}%){RESET}")
+
+
+def set_sort_order():
+    global SORT_DRIVES
+    keys = list(SORT_OPTIONS)
+    lines = []
+    for i, k in enumerate(keys, 1):
+        current = f"   {GREEN}● current{RESET}" if k == SORT_DRIVES else ""
+        lines.append(f"{CYAN}{BOLD}{i}{RESET}  {SORT_OPTIONS[k]}{current}")
+    lines.append(f"{GRAY}b  Back{RESET}")
+    print()
+    print(box(lines, title="Sort drives by"))
+    while True:
+        ans = ask("How should drives be ordered?").lower()
+        if ans in ("", "b", "back", "q"):
+            return
+        if ans.isdigit() and 1 <= int(ans) <= len(keys):
+            break
+        fail(f"Pick 1–{len(keys)} or b.")
+    SORT_DRIVES = keys[int(ans) - 1]
+    _save_and_report(f"Drives now sorted by {BOLD}{SORT_OPTIONS[SORT_DRIVES]}{RESET}")
+
+
+def settings_menu():
     while True:
         section("Settings")
         print(box([f"{CYAN}{BOLD}1{RESET}  Drive-full warning level   "
                    f"{_pct_color(WARN_AT_PERCENT / 100)}{WARN_AT_PERCENT}%{RESET}",
+                   f"{CYAN}{BOLD}2{RESET}  Sort drives by             {BOLD}{SORT_OPTIONS[SORT_DRIVES]}{RESET}",
                    f"{GRAY}b  Back to menu{RESET}"], title="Settings"))
         choice = ask("Choose a setting").lower()
         if choice in ("", "b", "back", "q"):
             return
-        if choice != "1":
-            fail("Pick 1 or b.")
-            continue
-
-        print(f"\n  {GRAY}Drives this full or fuller get a warning sign next to their percentage.{RESET}")
-        while True:
-            ans = ask("Warn when a drive reaches what percent? (1–100)", str(WARN_AT_PERCENT)).rstrip("%").strip()
-            try:
-                n = int(ans)
-            except ValueError:
-                fail("Enter a whole number, like 85.")
-                continue
-            if not 1 <= n <= 100:
-                fail("Enter a number from 1 to 100.")
-                continue
-            break
-
-        old, WARN_AT_PERCENT = WARN_AT_PERCENT, n
-        try:
-            save_settings()
-            ok(f"Warning set to {BOLD}{n}%{RESET} {GRAY}(was {old}%, saved to {SETTINGS_FILE}){RESET}")
-        except OSError as e:
-            fail(f"Couldn't save settings: {e}. Using {n}% until you quit.")
-        print()
-        storage_panel()          # show the result right away
+        if choice == "1":
+            set_warning_level()
+        elif choice == "2":
+            set_sort_order()
+        else:
+            fail("Pick 1, 2 or b.")
 
 
 def fit_cards():
