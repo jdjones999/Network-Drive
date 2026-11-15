@@ -94,22 +94,86 @@ def section(title):
     print(f"\n  {ORANGE}{BOLD}▌{title}{RESET}\n")
 
 
+class Cancelled(Exception):
+    """Raised when the user presses Esc at a prompt."""
+
+
+def read_line(prompt):
+    """Like input(), but pressing Esc cancels immediately (raises Cancelled).
+
+    Reads keys one at a time so Esc works without pressing Enter. Arrow keys and
+    other special keys (which also start with an Esc byte) are ignored.
+    Backspace, Ctrl+U (clear line), Ctrl+C and Ctrl+D work as usual.
+    """
+    if not sys.stdin.isatty():
+        return input(prompt)
+    import codecs, select, termios, tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+    buf = []
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)                         # keys arrive one by one; Ctrl+C still works
+        while True:
+            b = os.read(fd, 1)
+            if b in (b"\r", b"\n"):
+                sys.stdout.write("\n")
+                return "".join(buf)
+            if b == b"\x1b":
+                # A lone Esc has nothing right behind it; arrow keys etc. do.
+                if select.select([fd], [], [], 0.05)[0]:
+                    # Swallow exactly one key code, e.g. ESC [ A (Up) or ESC O P (F1),
+                    # so anything typed right after it is kept.
+                    nxt = os.read(fd, 1)
+                    if nxt == b"[":
+                        while True:
+                            c = os.read(fd, 1)
+                            if not c or 0x40 <= c[0] <= 0x7E:
+                                break
+                    elif nxt == b"O":
+                        os.read(fd, 1)
+                    continue
+                sys.stdout.write(f"{GRAY}esc{RESET}\n")
+                raise Cancelled()
+            if b in (b"\x7f", b"\x08"):         # Backspace
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+            elif b == b"\x15":                   # Ctrl+U: clear the line
+                sys.stdout.write("\b \b" * len(buf))
+                buf.clear()
+            elif b == b"\x04":                   # Ctrl+D
+                if not buf:
+                    raise EOFError
+            elif b >= b" ":
+                ch = decoder.decode(b)
+                if ch:
+                    buf.append(ch)
+                    sys.stdout.write(ch)
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def ask(prompt, default=None):
     hint = f" {GRAY}[{default}]{RESET}" if default else ""
-    ans = input(f"\n  {MAGENTA}?{RESET} {BOLD}{prompt}{RESET}{hint} {CYAN}›{RESET} ").strip()
+    ans = read_line(f"\n  {MAGENTA}?{RESET} {BOLD}{prompt}{RESET}{hint} {CYAN}›{RESET} ").strip()
     return ans or (default or "")
 
 
 def confirm(prompt, default=True):
     choice = f"{GRAY}({'Y/n' if default else 'y/N'}){RESET}"
-    ans = input(f"\n  {MAGENTA}?{RESET} {BOLD}{prompt}{RESET} {choice} {CYAN}›{RESET} ").strip().lower()
+    ans = read_line(f"\n  {MAGENTA}?{RESET} {BOLD}{prompt}{RESET} {choice} {CYAN}›{RESET} ").strip().lower()
     return default if not ans else ans in ("y", "yes")
 
 
 def pick_numbers(prompt, maximum):
     """Ask for a comma-separated list of numbers. Returns [] if cancelled."""
     while True:
-        ans = ask(f"{prompt} {GRAY}(e.g. 1,3 · Enter to cancel){RESET}")
+        ans = ask(f"{prompt} {GRAY}(e.g. 1,3 · Enter or Esc to cancel){RESET}")
         if ans.lower() in ("", "q", "quit"):
             return []
         try:
@@ -985,7 +1049,7 @@ MENU_LINES = [f"{CYAN}{BOLD}1{RESET}  Mount drives at boot",
               f"{CYAN}{BOLD}2{RESET}  Share drives on the network",
               f"{CYAN}{BOLD}3{RESET}  Show drives & shares",
               f"{CYAN}{BOLD}4{RESET}  Settings",
-              f"{GRAY}q  Quit{RESET}"]
+              f"{GRAY}q  Quit  (or Esc){RESET}"]
 
 
 # ───────────────────────────── settings ─────────────────────────────
@@ -1053,7 +1117,7 @@ def set_sort_order():
     for i, k in enumerate(keys, 1):
         current = f"   {GREEN}● current{RESET}" if k == SORT_DRIVES else ""
         lines.append(f"{CYAN}{BOLD}{i}{RESET}  {SORT_OPTIONS[k]}{current}")
-    lines.append(f"{GRAY}b  Back{RESET}")
+    lines.append(f"{GRAY}b  Back  (or Esc){RESET}")
     print()
     print(box(lines, title="Sort drives by"))
     while True:
@@ -1073,16 +1137,19 @@ def settings_menu():
         print(box([f"{CYAN}{BOLD}1{RESET}  Drive-full warning level   "
                    f"{_pct_color(WARN_AT_PERCENT / 100)}{WARN_AT_PERCENT}%{RESET}",
                    f"{CYAN}{BOLD}2{RESET}  Sort drives by             {BOLD}{SORT_OPTIONS[SORT_DRIVES]}{RESET}",
-                   f"{GRAY}b  Back to menu{RESET}"], title="Settings"))
+                   f"{GRAY}b  Back to menu  (or Esc){RESET}"], title="Settings"))
         choice = ask("Choose a setting").lower()
         if choice in ("", "b", "back", "q"):
             return
-        if choice == "1":
-            set_warning_level()
-        elif choice == "2":
-            set_sort_order()
-        else:
-            fail("Pick 1, 2 or b.")
+        try:
+            if choice == "1":
+                set_warning_level()
+            elif choice == "2":
+                set_sort_order()
+            else:
+                fail("Pick 1, 2 or b.")
+        except Cancelled:
+            pass                                  # Esc: back to Settings, nothing changed
 
 
 def fit_cards():
@@ -1117,12 +1184,18 @@ def main_menu():
         storage_panel()
         print()
         print(box(MENU_LINES, title="Menu"))
-        choice = ask("Choose an option").lower()
+        try:
+            choice = ask("Choose an option").lower()
+        except Cancelled:
+            choice = "q"                          # Esc on the main menu quits
         if choice in ("q", "quit", "exit"):
             print(f"\n  {GRAY}Bye.{RESET}\n")
             return
         if choice in actions:
-            actions[choice]()
+            try:
+                actions[choice]()
+            except Cancelled:
+                info("Cancelled. No changes made.")   # Esc anywhere inside goes back here
         else:
             fail("Pick 1, 2, 3, 4 or q.")
 
