@@ -1,1011 +1,336 @@
-#!/usr/bin/env python3
+#!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 jdjones999 — https://github.com/jdjones999/Network-Drive
-"""
-Network Drive — Drive & Share Manager
-
-Mounts drives automatically at boot (via /etc/fstab) and shares them on the
-network with Samba, from a simple menu in the terminal.
-
-Install:  curl -fsSL https://raw.githubusercontent.com/jdjones999/Network-Drive/main/install.sh | sudo bash
-Run:      sudo samba-setup
-
-Settings you can change are near the top of each section, marked in CAPITALS:
-  TITLE_TEXT / TITLE_FONT / TITLE_COLOR   the big title at the top
-  STARTUP_BLANK_LINES / STARTUP_DELAY     how the screen is cleared on start
-  WARN_AT_PERCENT                         when ⚠ appears next to a drive
-  BAR_STYLE / TERMINAL_BG                 how the storage bars look
-"""
-import os
-import re
-import shutil
-import socket
-import subprocess
-import sys
-from datetime import datetime
-
-# ───────────────────────────── styling ─────────────────────────────
-
-USE_COLOR = (sys.stdout.isatty() or os.environ.get("FORCE_COLOR")) and not os.environ.get("NO_COLOR")
-
-
-def _c(code):
-    return f"\033[{code}m" if USE_COLOR else ""
-
-
-RESET, BOLD, DIM = _c("0"), _c("1"), _c("2")
-RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, GRAY = (
-    _c("91"), _c("92"), _c("93"), _c("94"), _c("95"), _c("96"), _c("90"))
-ORANGE = _c("38;5;208")
-
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def vlen(s):
-    """Visible length of a string (ignores color codes)."""
-    return len(_ANSI.sub("", s))
-
-
-def pad(s, width, align="<"):
-    gap = max(0, width - vlen(s))
-    return s + " " * gap if align == "<" else " " * gap + s
-
-
-def trunc(s, n):
-    return s if len(s) <= n else s[: n - 1] + "…"
-
-
-CARD_W = 0  # shared inner width so every card lines up (set by fit_cards)
-
-
-def box(lines, title="", color=CYAN, min_width=0):
-    """Return a rounded box around the given lines."""
-    title_txt = f" {BOLD}{title}{RESET}{color} " if title else ""
-    inner = max([vlen(l) for l in lines] + [vlen(title_txt) + 2, min_width, CARD_W])
-    out = [f"{color}╭─{title_txt}{'─' * (inner + 1 - vlen(title_txt))}╮{RESET}"]
-    for l in lines:
-        if _ANSI.sub("", l) and set(_ANSI.sub("", l)) == {"─"}:  # divider: stretch to full width
-            l = f"{GRAY}{'─' * inner}{RESET}"
-        out.append(f"{color}│{RESET} {pad(l, inner)} {color}│{RESET}")
-    out.append(f"{color}╰{'─' * (inner + 2)}╯{RESET}")
-    return "\n".join("  " + l for l in out)
-
-
-def table(headers, rows, aligns=None):
-    """Return table lines (header, rule, rows) with aligned columns."""
-    aligns = aligns or ["<"] * len(headers)
-    widths = [max([vlen(h)] + [vlen(r[i]) for r in rows]) for i, h in enumerate(headers)]
-    gap = "  "
-
-    def fmt(cells):
-        return gap.join(pad(c, widths[i], aligns[i]) for i, c in enumerate(cells)).rstrip()
-
-    total = sum(widths) + len(gap) * (len(widths) - 1)
-    return [f"{BOLD}{fmt(headers)}{RESET}", f"{GRAY}{'─' * total}{RESET}"] + [fmt(r) for r in rows]
-
-
-def ok(msg):    print(f"  {GREEN}✔{RESET} {msg}")
-def fail(msg):  print(f"  {RED}✖{RESET} {msg}")
-def warn(msg):  print(f"  {YELLOW}!{RESET} {msg}")
-def info(msg):  print(f"  {BLUE}•{RESET} {msg}")
-
-
-def section(title):
-    print(f"\n  {ORANGE}{BOLD}▌{title}{RESET}\n")
-
-
-def ask(prompt, default=None):
-    hint = f" {GRAY}[{default}]{RESET}" if default else ""
-    ans = input(f"\n  {MAGENTA}?{RESET} {BOLD}{prompt}{RESET}{hint} {CYAN}›{RESET} ").strip()
-    return ans or (default or "")
-
-
-def confirm(prompt, default=True):
-    choice = f"{GRAY}({'Y/n' if default else 'y/N'}){RESET}"
-    ans = input(f"\n  {MAGENTA}?{RESET} {BOLD}{prompt}{RESET} {choice} {CYAN}›{RESET} ").strip().lower()
-    return default if not ans else ans in ("y", "yes")
-
-
-def pick_numbers(prompt, maximum):
-    """Ask for a comma-separated list of numbers. Returns [] if cancelled."""
-    while True:
-        ans = ask(f"{prompt} {GRAY}(e.g. 1,3 · Enter to cancel){RESET}")
-        if ans.lower() in ("", "q", "quit"):
-            return []
-        try:
-            nums = sorted({int(x) for x in ans.replace(" ", "").split(",") if x})
-        except ValueError:
-            fail("Please enter numbers separated by commas.")
-            continue
-        if nums and all(1 <= n <= maximum for n in nums):
-            return nums
-        fail(f"Choose numbers between 1 and {maximum}.")
-
-
-def human(num_bytes):
-    try:
-        b = int(num_bytes)
-    except (TypeError, ValueError):
-        return "?"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if b < 1000 or unit == "TB":
-            return f"{b:.0f} {unit}" if unit == "B" else f"{b:.2f} {unit}"
-        b /= 1024
-
-
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
-
-
-# Internal-only interfaces other machines can't connect to (Docker, VMs).
-SKIP_IFACES = ("lo", "docker", "br-", "veth", "virbr", "cni", "flannel")
-
-
-def get_ips():
-    """Reachable IPv4 addresses as [(ip, kind, interface)], LAN first, Tailscale last."""
-    ips = []
-    try:
-        out = run(["ip", "-4", "-o", "addr", "show", "scope", "global"]).stdout
-    except OSError:
-        out = ""
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        iface, ip = parts[1], parts[3].split("/")[0]
-        if iface.startswith(SKIP_IFACES):
-            continue
-        if iface.startswith("tailscale"):
-            kind = "Tailscale"
-        elif iface.startswith("wl"):
-            kind = "Wi-Fi"
-        else:
-            kind = "Ethernet"
-        ips.append((ip, kind, iface))
-    # The interface the server actually routes through (lowest metric) goes first.
-    try:
-        m = re.search(r"\bdev (\S+)", run(["ip", "route", "get", "1.1.1.1"]).stdout)
-        main_iface = m.group(1) if m else None
-    except OSError:
-        main_iface = None
-    order = {"Ethernet": 0, "Wi-Fi": 1, "Tailscale": 2}
-    ips.sort(key=lambda x: (x[1] == "Tailscale", x[2] != main_iface, order[x[1]]))
-    return ips
-
-
-def primary_ip():
-    ips = get_ips()
-    return ips[0][0] if ips else "unknown-ip"
-
-
-def ip_lines(ips, share=None):
-    """One aligned line per address. With share, shows \\\\ip\\share paths."""
-    if not ips:
-        return [f"{GRAY}No network addresses found{RESET}"]
-    addrs = [f"\\\\{ip}\\{share}" if share else ip for ip, _, _ in ips]
-    w = max(len(a) for a in addrs)
-    kw = max(len(kind) for _, kind, _ in ips)
-    # Three even columns: address │ connection type │ interface name
-    return [f"{GREEN}●{RESET} {BOLD}{a.ljust(w)}{RESET}    {GRAY}{kind.ljust(kw)}    {iface}{RESET}"
-            for a, (_, kind, iface) in zip(addrs, ips)]
-
-
-# ───────────────────────────── system info ─────────────────────────────
-
-FSTAB = "/etc/fstab"
-SMB_CONF = "/etc/samba/smb.conf"
-
-# Partitions that hold LVM, swap, RAID or encryption and must not be mounted directly.
-NOT_MOUNTABLE = {"LVM2_member", "swap", "crypto_LUKS", "linux_raid_member", "zfs_member", "BitLocker"}
-# Mount points that should never be offered as network shares.
-SYSTEM_MOUNTS = {"/", "/boot", "/boot/efi", "/home", "/var", "/usr", "/tmp", "none", "swap"}
-
-
-def get_drives():
-    """All partitions with a filesystem, from lsblk + blkid."""
-    drives = []
-    try:
-        out = run(["lsblk", "-r", "-b", "-pno", "NAME,TYPE,SIZE,MOUNTPOINT"]).stdout
-    except OSError as e:
-        fail(f"Could not list drives: {e}")
-        return []
-
-    for line in out.strip().splitlines():
-        parts = line.split()
-        if len(parts) < 3 or parts[1] != "part" or "/dev/loop" in parts[0]:
-            continue
-        name, size = parts[0], parts[2]
-        mountpoint = parts[3].replace("\\x20", " ") if len(parts) > 3 else ""
-
-        info_ = {}
-        for bline in run(["blkid", name, "-o", "export"]).stdout.splitlines():
-            if "=" in bline:
-                k, v = bline.split("=", 1)
-                info_[k] = v.strip('"')
-        if info_.get("UUID") and info_.get("TYPE"):
-            drives.append({
-                "NAME": name.split("/")[-1],
-                "SIZE": size,
-                "FSTYPE": info_["TYPE"],
-                "UUID": info_["UUID"],
-                "LABEL": info_.get("LABEL"),
-                "MOUNTPOINT": mountpoint,
-            })
-    return drives
-
-
-def read_fstab():
-    """Returns ({uuid: mount_point}, {all mount points in fstab})."""
-    by_uuid, targets = {}, set()
-    try:
-        with open(FSTAB) as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                parts = s.split()
-                if len(parts) < 2:
-                    continue
-                targets.add(parts[1])
-                # Handles UUID=..., UUID="..." and /dev/disk/by-uuid/... (any case, e.g. NTFS IDs)
-                m = re.match(r'(?:UUID="?|/dev/disk/by-uuid/)([^"\s]+)', parts[0])
-                if m:
-                    by_uuid[m.group(1)] = parts[1]
-    except OSError as e:
-        warn(f"Could not read {FSTAB}: {e}")
-    return by_uuid, targets
-
-
-def read_samba_shares():
-    """Returns ({path: share_name}, {all section names, lower-case})."""
-    shares, sections, current = {}, set(), None
-    try:
-        with open(SMB_CONF) as f:
-            for line in f:
-                s = line.strip()
-                if not s or s[0] in "#;":
-                    continue
-                m = re.match(r"\[(.+)\]", s)
-                if m:
-                    current = m.group(1)
-                    sections.add(current.lower())
-                elif "=" in s and current:
-                    k, v = s.split("=", 1)
-                    if k.strip().lower() == "path":
-                        shares[v.strip().rstrip("/")] = current
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        warn(f"Could not read {SMB_CONF}: {e}")
-    return shares, sections
-
-
-# ───────────────────────────── views ─────────────────────────────
-
-def drive_table(drives, fstab_uuids, fstab_targets):
-    """Print the drive table and return the list of drives that can be set up."""
-    lines, available = drive_table_lines(drives, fstab_uuids, fstab_targets)
-    print(box(lines, title="Drives"))
-    return available
-
-
-def drive_table_lines(drives, fstab_uuids, fstab_targets):
-    rows, available = [], []
-    for d in drives:
-        fs, mounted = d["FSTYPE"], d["MOUNTPOINT"]
-        auto = fstab_uuids.get(d["UUID"])
-        label = d["LABEL"] if d["LABEL"] else f"{GRAY}—{RESET}"
-        num, dev = "", f"/dev/{d['NAME']}"
-
-        if fs in NOT_MOUNTABLE:
-            status, where = f"{GRAY}· system volume{RESET}", f"{GRAY}—{RESET}"
-            dev, label = f"{GRAY}{dev}{RESET}", f"{GRAY}{_ANSI.sub('', label)}{RESET}"
-        elif mounted and (auto or mounted in fstab_targets):
-            status, where = f"{GREEN}● mounted · at boot{RESET}", mounted
-        elif mounted:
-            status, where = f"{YELLOW}● mounted · this boot only{RESET}", mounted
-        elif auto:
-            status, where = f"{YELLOW}○ set up · not mounted{RESET}", f"{GRAY}{auto}{RESET}"
-        else:
-            available.append(d)
-            num = f"{CYAN}{BOLD}{len(available)}{RESET}"
-            status, where = f"{CYAN}○ available{RESET}", f"{GRAY}—{RESET}"
-
-        rows.append([num, dev, human(d["SIZE"]), label, fs, where, status])
-
-    lines = table(["#", "Device", "Size", "Label", "Type", "Mount point", "Status"],
-                  rows, [">", "<", ">", "<", "<", "<", "<"])
-    return lines, available
-
-
-def share_table(candidates, shares, ip):
-    rows, unshared = [], []
-    for mp in candidates:
-        if mp in shares:
-            rows.append(["", mp, f"{GREEN}● shared{RESET}  {GRAY}\\\\{ip}\\{shares[mp]}{RESET}"])
-        else:
-            unshared.append(mp)
-            rows.append([f"{CYAN}{BOLD}{len(unshared)}{RESET}", mp, f"{CYAN}○ not shared{RESET}"])
-    print(box(table(["#", "Mount point", "Status"], rows, [">", "<", "<"]), title="Network shares"))
-    return unshared
-
-
-def preview(mount_point, limit=12):
-    try:
-        entries = list(os.scandir(mount_point))
-    except OSError as e:
-        fail(f"Could not open {mount_point}: {e.strerror}")
-        return
-
-    def is_dir(e):
-        try:
-            return e.is_dir()
-        except OSError:
-            return False
-
-    entries.sort(key=lambda e: (not is_dir(e), e.name.lower()))
-    lines = []
-    for e in entries[:limit]:
-        if is_dir(e):
-            lines.append(f"{BLUE}▸ {trunc(e.name, 60)}/{RESET}")
-        else:
-            try:
-                size = human(e.stat().st_size)
-            except OSError:
-                size = "?"
-            lines.append(f"  {trunc(e.name, 60)}  {GRAY}{size}{RESET}")
-    if not entries:
-        lines.append(f"{GRAY}(empty){RESET}")
-    elif len(entries) > limit:
-        lines.append(f"{GRAY}… and {len(entries) - limit} more{RESET}")
-    print(box(lines, title=f"{mount_point} · {len(entries)} items", color=GRAY))
-
-
-# ───────────────────────────── actions ─────────────────────────────
-
-def samba_service():
-    """Samba's service name: smbd on Debian/Ubuntu, smb on Fedora/openSUSE/Arch."""
-    for name in ("smbd", "smb"):
-        if run(["systemctl", "cat", f"{name}.service"]).returncode == 0:
-            return name
-    return "smbd"
-
-
-def sanitize(name):
-    return re.sub(r"[^\w-]", "", (name or "").replace(" ", "-")).strip("-")
-
-
-def mount_drives():
-    section("Mount drives at boot")
-    drives = get_drives()
-    if not drives:
-        fail("No drives detected.")
-        return
-    fstab_uuids, fstab_targets = read_fstab()
-    available = drive_table(drives, fstab_uuids, fstab_targets)
-    if not available:
-        print()
-        ok("Every drive is already set up. Nothing to do.")
-        return
-
-    nums = pick_numbers("Which drive(s) should mount automatically?", len(available))
-    if not nums:
-        info("Cancelled. No changes made.")
-        return
-
-    taken = set(fstab_targets) | {d["MOUNTPOINT"] for d in drives if d["MOUNTPOINT"]}
-    plan = []
-    for n in nums:
-        d = available[n - 1]
-        default = sanitize(d["LABEL"]) or None
-        while True:
-            name = sanitize(ask(f"Folder name for {CYAN}/dev/{d['NAME']}{RESET}{BOLD} under /mnt", default))
-            if not name:
-                fail("The name can't be empty.")
-                continue
-            mp = f"/mnt/{name}"
-            if mp in taken:
-                fail(f"{mp} is already in use. Pick another name.")
-                continue
-            taken.add(mp)
-            plan.append((d, mp))
-            break
-
-    print()
-    print(box([f"/dev/{d['NAME']}  {GRAY}→{RESET}  {BOLD}{mp}{RESET}  {GRAY}({d['FSTYPE']}, {human(d['SIZE'])}){RESET}"
-               for d, mp in plan], title="Ready to add", color=YELLOW))
-    if not confirm("Write these to /etc/fstab?", default=False):
-        info("Cancelled. No changes made.")
-        return
-
-    # Back up fstab
-    backup = f"{FSTAB}.bak-{datetime.now():%Y%m%d-%H%M%S}"
-    try:
-        shutil.copy2(FSTAB, backup)
-        ok(f"Backed up fstab to {GRAY}{backup}{RESET}")
-    except OSError as e:
-        fail(f"Could not back up fstab ({e}). Stopping without changes.")
-        return
-
-    # Write entries. nofail + short timeout = server still boots if a drive is missing.
-    try:
-        with open(FSTAB, "r+") as f:
-            content = f.read()
-            if content and not content.endswith("\n"):
-                f.write("\n")
-            f.write(f"\n# Added by samba-setup.py on {datetime.now():%Y-%m-%d %H:%M}\n")
-            for d, mp in plan:
-                os.makedirs(mp, exist_ok=True)
-                fs_pass = 2 if d["FSTYPE"] in ("ext2", "ext3", "ext4") else 0
-                opts = "defaults,nofail,nodiscard,x-systemd.device-timeout=10s"
-                f.write(f"UUID={d['UUID']}\t{mp}\t{d['FSTYPE']}\t{opts}\t0\t{fs_pass}\n")
-        ok("Updated /etc/fstab")
-    except OSError as e:
-        fail(f"Could not write fstab: {e}")
-        return
-
-    run(["systemctl", "daemon-reload"])
-
-    for d, mp in plan:
-        r = run(["mount", mp])
-        if r.returncode == 0 or os.path.ismount(mp):
-            ok(f"Mounted {BOLD}{mp}{RESET}")
-            print()
-            preview(mp)
-        else:
-            fail(f"Could not mount {mp}: {r.stderr.strip()}")
-            info(f"Your previous fstab is saved at {backup}")
-
-
-def setup_samba():
-    section("Share drives on the network")
-    if not os.path.exists(SMB_CONF):
-        fail("Samba isn't installed. Run the Network Drive installer again to set it up.")
-        return
-
-    fstab_uuids, _ = read_fstab()
-    candidates = sorted({mp for mp in fstab_uuids.values() if mp not in SYSTEM_MOUNTS})
-    if not candidates:
-        warn("No data drives are set up yet. Use option 1 to mount one first.")
-        return
-
-    ip = primary_ip()
-    shares, sections = read_samba_shares()
-    unshared = share_table(candidates, shares, ip)
-    if not unshared:
-        print()
-        ok("Every mounted drive is already shared.")
-        return
-
-    nums = pick_numbers("Which drive(s) should be shared?", len(unshared))
-    if not nums:
-        info("Cancelled. No changes made.")
-        return
-
-    new = []
-    for n in nums:
-        mp = unshared[n - 1]
-        base = name = os.path.basename(mp) or "share"
-        i = 2
-        while name.lower() in sections:
-            name, i = f"{base}-{i}", i + 1
-        sections.add(name.lower())
-        new.append((name, mp))
-
-    backup = f"{SMB_CONF}.bak-{datetime.now():%Y%m%d-%H%M%S}"
-    try:
-        shutil.copy2(SMB_CONF, backup)
-        with open(SMB_CONF, "a") as f:
-            for name, mp in new:
-                f.write(f"\n[{name}]\n"
-                        f"   comment = Guest-accessible share ({name})\n"
-                        f"   path = {mp}\n"
-                        f"   browseable = yes\n"
-                        f"   read only = no\n"
-                        f"   guest ok = yes\n")
-        ok(f"Updated smb.conf {GRAY}(backup: {backup}){RESET}")
-    except OSError as e:
-        fail(f"Could not update {SMB_CONF}: {e}")
-        return
-
-    if run(["testparm", "-s"]).returncode != 0:
-        warn(f"Samba reports a config problem. Check it with: {BOLD}testparm{RESET}")
-
-    r = run(["systemctl", "restart", samba_service()])
-    if r.returncode != 0:
-        fail(f"Samba didn't restart: {r.stderr.strip()}")
-        return
-    ok("Restarted Samba")
-
-    print()
-    ips = get_ips()
-    lines = []
-    for name, mp in new:
-        lines += [f"{BOLD}{name}{RESET}  {GRAY}{mp}{RESET}"] + ["  " + l for l in ip_lines(ips, share=name)]
-    lines += ["", f"{GRAY}Windows: paste an address into File Explorer's address bar.{RESET}",
-              f"{GRAY}No password needed.{RESET}"]
-    print(box(lines, title="Shared on your network", color=GREEN))
-
-
-# Show ⚠ next to a drive's percentage once it's this full (or fuller).
-# This is the default; change it from the menu: 4 Settings (saved in /etc/network-drive/settings.conf).
-WARN_AT_PERCENT = 85
-
-# Order of drives in the Storage panel (also changeable from 4 Settings).
-SORT_DRIVES = "name"
-SORT_OPTIONS = {                       # setting value → menu label
-    "name":     "Name (A → Z)",
-    "usage":    "Fullness (least → most full)",
-    "capacity": "Capacity (smallest → largest)",
+# ──────────────────────────────────────────────────────────────────────────────
+#  Network Drive installer
+#
+#  Install straight from GitHub:
+#      curl -fsSL https://raw.githubusercontent.com/jdjones999/Network-Drive/main/install.sh | sudo bash
+#
+#  Or from a clone of the repo:
+#      git clone https://github.com/jdjones999/Network-Drive.git
+#      cd Network-Drive
+#      sudo bash install.sh
+#
+#  Works on: Ubuntu/Debian (apt), Fedora/RHEL (dnf), Arch (pacman), openSUSE (zypper)
+#
+#  What it does:
+#    1. Installs the packages the tool needs (python3, figlet, samba, ntfs-3g, …)
+#    2. Downloads the "rowancap" figlet font and puts it in figlet's font folder
+#    3. Installs the tool as /usr/local/bin/samba-setup (owner root, mode 755)
+#    4. Sets up Samba (enabled, running, and only reachable from local networks/Tailscale)
+#    5. Checks everything and prints a summary
+#
+#  Safe to run again at any time: it updates the tool and skips what's done.
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Where everything comes from ──────────────────────────────────────────────
+REPO_RAW="https://raw.githubusercontent.com/jdjones999/Network-Drive/main"
+
+APP_NAME="samba-setup"                          # the command you run
+SCRIPT_FILE="samba-setup.py"                    # the tool's file in the repo
+INSTALL_PATH="/usr/local/bin/${APP_NAME}"
+
+FONT_NAME="rowancap"
+FONT_FILE="${FONT_NAME}.flf"
+# Font downloads, tried in order: the official FIGlet font archive first,
+# then backups (a copy in this repo, if present, and pyfiglet's copy).
+FONT_URLS=(
+  "http://www.figlet.org/fonts/${FONT_FILE}"
+  "${REPO_RAW}/${FONT_FILE}"
+  "https://raw.githubusercontent.com/pwaller/pyfiglet/main/pyfiglet/fonts-contrib/${FONT_FILE}"
+)
+# SHA-256 fingerprint of the genuine rowancap.flf. A download is only installed if
+# it matches, so a tampered file (e.g. swapped on the way over plain http) is rejected.
+# Get it once on a machine where the font already works:  sha256sum "$(figlet -I2)/rowancap.flf"
+# Leave empty to skip the check (not recommended).
+FONT_SHA256=""
+
+# Only these networks may connect to Samba: this machine, private home/office
+# ranges, and Tailscale. Everything else (the internet) is refused.
+SAMBA_HOSTS_ALLOW="127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10"
+
+# Where figlet keeps fonts on different systems (used only if figlet can't tell us).
+FONT_DIR_GUESSES=(
+  /usr/share/figlet            # Debian, Ubuntu, Fedora, Arch, openSUSE
+  /usr/share/figlet/fonts
+  /usr/local/share/figlet      # source installs, BSD
+  /usr/share/games/figlet
+)
+
+# ── Pretty output ────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  O=$'\033[38;5;208m'; G=$'\033[92m'; R=$'\033[91m'; Y=$'\033[93m'; C=$'\033[96m'
+  D=$'\033[90m'; B=$'\033[1m'; N=$'\033[0m'
+else
+  O=""; G=""; R=""; Y=""; C=""; D=""; B=""; N=""
+fi
+step() { printf '\n  %s▌%s%s\n' "$O$B" "$1" "$N"; }
+ok()   { printf '  %s✔%s %s\n' "$G" "$N" "$1"; }
+info() { printf '  %s•%s %s\n' "$C" "$N" "$1"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$1"; }
+fail() { printf '  %s✖%s %s\n' "$R" "$N" "$1"; }
+die()  { fail "$1"; exit 1; }
+
+# Download a URL to a file with curl (or wget). Non-zero on any failure.
+download() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 2 --connect-timeout 10 "$1" -o "$2" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --tries=2 --timeout=10 -O "$2" "$1" 2>/dev/null
+  else
+    return 1
+  fi
 }
-SORT_SHORT = {"name": "name", "usage": "fullness", "capacity": "capacity"}
 
-# Storage bar style:
-#   "grid"   – thin gap between segments AND between drives (default, like abtop)
-#   "lines"  – ▇  thin gap between drives only; segments touch
-#   "gaps"   – ▉  thin gap between segments only; drives' bars touch
-#   "blocks" – ■  separate squares with space on every side
-BAR_STYLE = "grid"
-# Your terminal's background color. The thin gaps are painted in this color.
-# Windows Terminal's default "Campbell" theme is (12, 12, 12).
-TERMINAL_BG = (12, 12, 12)
-
-# "grid" trick: 🭾 draws only a thin strip on the right and top edges of a cell.
-# Painting that strip in the terminal background color and filling the cell's
-# background with the bar color leaves a block with a thin gap right and above.
-GRID_CHAR = "\U0001FB7E"
-_BAR_CHARS = {"lines": "▇", "gaps": "▉", "blocks": "■"}
-if not USE_COLOR:
-    CELL, EMPTY = "#", "·"
-else:
-    CELL = EMPTY = _BAR_CHARS.get(BAR_STYLE, GRID_CHAR)
-BAR_PREFIX = ""
-# Heat gradient (24-bit): blue → steel → khaki → yellow → orange, like abtop.
-GRADIENT = [
-    (0.00, (24, 128, 255)),   # blue
-    (0.30, (86, 150, 215)),   # steel blue
-    (0.48, (160, 172, 150)),  # grey-khaki
-    (0.65, (228, 196, 92)),   # sand yellow
-    (0.80, (255, 190, 30)),   # amber
-    (0.92, (255, 140, 20)),   # orange
-    (1.00, (255, 96, 24)),    # deep orange
-]
-TRACK_RGB = (30, 38, 58)      # dark navy empty part of a bar
-TRACK = _c("38;2;%d;%d;%d" % TRACK_RGB)
-
-
-def _grad_rgb(p):
-    p = min(max(p, 0.0), 1.0)
-    for (p0, c0), (p1, c1) in zip(GRADIENT, GRADIENT[1:]):
-        if p <= p1:
-            t = (p - p0) / (p1 - p0) if p1 > p0 else 0
-            return tuple(round(c0[i] + (c1[i] - c0[i]) * t) for i in range(3))
-    return GRADIENT[-1][1]
-
-
-def _fill_color(p):
-    """Color for a position/percentage (0..1) along the gradient."""
-    return _c("38;2;%d;%d;%d" % _grad_rgb(p))
-
-
-def _pct_color(p):
-    return _c("38;2;%d;%d;%d" % _grad_rgb(p)) + BOLD
-
-
-def usage_bar(frac, width=24):
-    """Segmented gradient bar: each filled cell takes the color of its position."""
-    filled = min(width, round(frac * width))
-    if frac > 0 and filled == 0:
-        filled = 1
-    if USE_COLOR and BAR_STYLE not in _BAR_CHARS:
-        # grid: cell background = bar color, glyph (thin right/top strip) = terminal background
-        gap = "38;2;%d;%d;%d" % TERMINAL_BG
-        cells = ["\033[%s;48;2;%d;%d;%dm%s" % ((gap,) + _grad_rgb(i / (width - 1)) + (GRID_CHAR,))
-                 for i in range(filled)]
-        cells += ["\033[%s;48;2;%d;%d;%dm%s" % ((gap,) + TRACK_RGB + (GRID_CHAR,))] * (width - filled)
-        return "".join(cells) + RESET
-    cells = [f"{_fill_color(i / (width - 1))}{CELL}" for i in range(filled)]
-    cells += [f"{TRACK}{EMPTY}"] * (width - filled)
-    return BAR_PREFIX + "".join(cells) + RESET
-
-
-def storage_panel():
-    lines = storage_lines()
-    if not lines:
-        return
-    # Stretch the bars so the card's contents fill the shared card width.
-    extra = CARD_W - max(vlen(l) for l in lines)
-    if extra > 0:
-        lines = storage_lines(bar_width=24 + extra)
-    print()
-    print(box(lines, title=f"Storage · by {SORT_SHORT[SORT_DRIVES]}", color=BLUE))
-
-
-def storage_lines(bar_width=24):
-    """Fill gauges for every data drive set up in fstab (None if there are none)."""
-    fstab_uuids, _ = read_fstab()
-    mps = {mp for mp in fstab_uuids.values() if mp.startswith("/") and mp not in SYSTEM_MOUNTS}
-    if not mps:
-        return None
-    shares, _ = read_samba_shares()
-
-    # Gather usage first, so the drives can be sorted by it.
-    mounted, unmounted = [], []
-    for mp in mps:
-        try:
-            if not os.path.ismount(mp):
-                raise OSError
-            mounted.append((mp, shutil.disk_usage(mp)))
-        except OSError:
-            unmounted.append(mp)
-
-    name_key = lambda mp: os.path.basename(mp.rstrip("/")).lower()
-    if SORT_DRIVES == "usage":        # least full → most full
-        mounted.sort(key=lambda d: (d[1].used / d[1].total if d[1].total else 0, name_key(d[0])))
-    elif SORT_DRIVES == "capacity":   # smallest → largest
-        mounted.sort(key=lambda d: (d[1].total, name_key(d[0])))
-    else:                             # name, A → Z
-        mounted.sort(key=lambda d: name_key(d[0]))
-    unmounted.sort(key=name_key)      # drives that aren't mounted always go last
-
-    rows = []
-    for mp, u in mounted:
-        name = trunc(os.path.basename(mp.rstrip("/")) or mp, 20)
-        net = f"{GREEN}● shared{RESET}" if mp.rstrip("/") in shares else f"{GRAY}○ local{RESET}"
-        frac = u.used / u.total if u.total else 0
-        # ⚠ marks drives at or above WARN_AT_PERCENT. Some terminals (Windows Terminal)
-        # draw ⚠ two columns wide, so it always gets a spare space after it to spill into.
-        warn_mark = "⚠" if USE_COLOR else "!"
-        mark = warn_mark if frac * 100 >= WARN_AT_PERCENT else " "
-        pct = f"{_pct_color(frac)}{frac * 100:.0f}%{mark} {RESET}"
-        rows.append([f"{BOLD}{name}{RESET}", usage_bar(frac, bar_width), pct,
-                     f"{human(u.used)} {GRAY}/{RESET} {human(u.total)}", net])
-    for mp in unmounted:
-        name = trunc(os.path.basename(mp.rstrip("/")) or mp, 20)
-        net = f"{GREEN}● shared{RESET}" if mp.rstrip("/") in shares else f"{GRAY}○ local{RESET}"
-        rows.append([f"{GRAY}{name}{RESET}", f"{GRAY}not mounted{RESET}", "", "", net])
-    return table(["Drive", "Usage", "", "Used / Size", "Network"], rows,
-                 ["<", "<", ">", ">", "<"])
-
-
-def show_status():
-    section("Overview")
-    drives = get_drives()
-    fstab_uuids, fstab_targets = read_fstab()
-    drive_table(drives, fstab_uuids, fstab_targets)
-    candidates = sorted({mp for mp in fstab_uuids.values() if mp not in SYSTEM_MOUNTS})
-    if candidates and os.path.exists(SMB_CONF):
-        print()
-        shares, _ = read_samba_shares()
-        share_table(candidates, shares, primary_ip())
-
-
-# ───────────────────────────── main ─────────────────────────────
-
-# ── Startup ──
-STARTUP_BLANK_LINES = 75   # pushes old output up so the tool starts on a clean screen (scrollback is kept)
-STARTUP_DELAY = 0          # seconds to pause after that; set to 1 to match your `sleep 1`
-
-TITLE_TEXT = "NETWORK DRIVE"
-# High-resolution pixel font: 10 pixels tall. Two pixel rows are packed into each
-# text row with half-blocks (▀ ▄ █), so pixels are square and curves/diagonals are smooth.
-FONT = {
-    "N": ["##....##", "###...##", "###...##", "####..##", "##.##.##",
-          "##.##.##", "##..####", "##...###", "##...###", "##....##"],
-    "E": ["#######", "#######", "##.....", "##.....", "######.",
-          "######.", "##.....", "##.....", "#######", "#######"],
-    "T": ["########", "########", "...##...", "...##...", "...##...",
-          "...##...", "...##...", "...##...", "...##...", "...##..."],
-    "W": ["##......##", "##......##", "##......##", "##......##", "##..##..##",
-          "##..##..##", "##.####.##", "####..####", "###....###", "##......##"],
-    "O": [".######.", "########", "##....##", "##....##", "##....##",
-          "##....##", "##....##", "##....##", "########", ".######."],
-    "R": ["#######.", "########", "##....##", "##....##", "########",
-          "#######.", "##..##..", "##...##.", "##....##", "##....##"],
-    "K": ["##....##", "##...##.", "##..##..", "##.##...", "####....",
-          "####....", "##.##...", "##..##..", "##...##.", "##....##"],
-    "D": ["######..", "#######.", "##...###", "##....##", "##....##",
-          "##....##", "##....##", "##...###", "#######.", "######.."],
-    "I": ["######", "######", "..##..", "..##..", "..##..",
-          "..##..", "..##..", "..##..", "######", "######"],
-    "V": ["##......##", "##......##", "##......##", "##......##", ".##....##.",
-          ".##....##.", "..##..##..", "..##..##..", "...####...", "....##...."],
-    " ": ["...."] * 10,
+# True if the file is a real figlet font (they all start with "flf2a") and,
+# when FONT_SHA256 is set, matches that fingerprint exactly.
+is_font() {
+  [ -s "$1" ] && head -c 5 "$1" | grep -q '^flf2a' || return 1
+  if [ -n "$FONT_SHA256" ]; then
+    [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$FONT_SHA256" ] || return 1
+  fi
 }
-FONT_HEIGHT = 10        # pixels → 5 text rows
-LETTER_GAP = 1          # blank pixel columns between letters
-TITLE_COLORS = [214, 214, 208, 208, 202]  # amber → orange, top to bottom (one per text row)
 
+# ── Package manager support ──────────────────────────────────────────────────
+# Sets PM and PACKAGES for this system.
+detect_package_manager() {
+  if   command -v apt-get >/dev/null 2>&1; then
+    PM=apt
+    PACKAGES=(python3 figlet samba ntfs-3g util-linux iproute2 curl ca-certificates)
+  elif command -v dnf >/dev/null 2>&1; then
+    PM=dnf
+    PACKAGES=(python3 figlet samba samba-common-tools ntfs-3g util-linux iproute curl ca-certificates)
+  elif command -v pacman >/dev/null 2>&1; then
+    PM=pacman
+    PACKAGES=(python figlet samba ntfs-3g util-linux iproute2 curl ca-certificates)
+  elif command -v zypper >/dev/null 2>&1; then
+    PM=zypper
+    PACKAGES=(python3 figlet samba ntfs-3g util-linux iproute2 curl ca-certificates)
+  else
+    die "Unsupported system: needs apt, dnf, pacman or zypper."
+  fi
+}
 
-# Smooth title: pre-rendered from a bold display font with soft (anti-aliased) edges.
-# Each digit is how much of that pixel is covered (blank = empty, 9 = solid).
-# Two pixel rows are packed into each text row using ▀/▄ with separate top and
-# bottom colors, so the result is about twice as detailed as plain blocks.
-TITLE_BITMAP = [
-    "886   882 28888886 288888881 885  685  688    6996    488884    784  2883    388873    188886    487 1882   588  8888888",
-    "999   994 49999999 499999993 999  999  999   799996   7999996   997  999     6999996   2999999   799 1996   999 19999999",
-    "9993  994 39999998 499999993 999  999  998  29999991  69999991  996 1997     59999993  29999995  799  998   998 19999999",
-    "9998  994 49999999 499999994 899  999  996  89999997  69999996  996 7991     59999999  29999999  799  999   996 19999999",
-    "9999  994 49953332  3399933  599 1999  994  99923999  69913999  996 999      599349991 29941999  799  799  2993 19963333",
-    "99992 994 499         898    399 399911992 1995  799  699  799  9953993      599  3994 2991 399  799  5991 4991 1992",
-    "99997 994 4991        999    199149993299  3991  2992 699  699  996999       599   997 2992 2991 799  2993 799  1993",
-    "999991994 49999993    998     99369995499  599    994 699  899  999995       599   998 299  599  799   995 999  19999996",
-    "999995994 49999993    998     99589897699  599    994 69956998  999997       599   999 29965999  799   997 997  19999997",
-    "996999994 49999993    998     99799598898  599    994 69999994  999999       599   999 29999998  799   999 995  19999997",
-    "995599994 49999993    998     89999299996  599    994 6999999   9999992      599   998 29999992  799   6992992  19999996",
-    "995 99994 4991        998     69999 99994  3991  2992 6999996   9998997      599   997 2999999   799   499599   1993",
-    "996 99994 499         998     39999 99992  1995  799  6991999   999 899      599  3994 2993699   799   199999   1992",
-    "996 69994 49953332    998     19998 9999    99923999  699 599   998 4993     599339991 299  993  799    99999   19963333",
-    "996 19994 49999999    998      9996 7999    89999997  699 1993  996  998     59999999  2991 997  799    99997   19999999",
-    "996  9994 39999998    998      9994 5999    29999991  699  997  996  999     59999993  2991 899  799    89994    9999999",
-    "997  6994 49999999    999      9992 3999     799996   699  999  997  5994    6999996   2991 5991 799    59992   19999999",
-    "884   882 28888886    686      588   884      6996    487  388  784   885    388883    188   882 587    1888     8888888",
-]
-TITLE_TOP_RGB = (255, 196, 0)      # amber at the top of the letters
-TITLE_BOTTOM_RGB = (255, 84, 0)    # orange at the bottom
+is_installed() {   # is_installed PACKAGE
+  case "$PM" in
+    apt)        dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed" ;;
+    dnf|zypper) rpm -q "$1" >/dev/null 2>&1 ;;
+    pacman)     pacman -Q "$1" >/dev/null 2>&1 ;;
+  esac
+}
 
+install_packages() {   # install_packages PKG...  (</dev/null: can't eat a piped script)
+  case "$PM" in
+    apt)    export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq </dev/null && apt-get install -y -qq "$@" </dev/null >/dev/null ;;
+    dnf)    dnf install -y -q "$@" </dev/null >/dev/null ;;
+    pacman) pacman -Sy --needed --noconfirm "$@" </dev/null >/dev/null ;;
+    zypper) zypper --non-interactive --quiet install "$@" </dev/null >/dev/null ;;
+  esac
+}
 
-def _title_rgb(level, y, height):
-    t = y / max(1, height - 1)
-    base = [TITLE_TOP_RGB[i] + (TITLE_BOTTOM_RGB[i] - TITLE_TOP_RGB[i]) * t for i in range(3)]
-    a = level / 9
-    return tuple(round(TERMINAL_BG[i] + (base[i] - TERMINAL_BG[i]) * a) for i in range(3))
+# figlet's font folder on this system.
+figlet_font_dir() {
+  local d
+  d="$(figlet -I2 2>/dev/null || true)"            # figlet reports its own folder
+  if [ -n "$d" ] && [ -d "$d" ]; then echo "$d"; return; fi
+  for d in "${FONT_DIR_GUESSES[@]}"; do             # otherwise find standard.flf
+    if [ -f "$d/standard.flf" ]; then echo "$d"; return; fi
+  done
+  echo /usr/share/figlet
+}
 
+main() {
+  local local_dir=""
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "$TMP"' EXIT
 
-def _smooth_title_lines():
-    h = len(TITLE_BITMAP) + len(TITLE_BITMAP) % 2
-    w = max(len(r) for r in TITLE_BITMAP)
-    bmp = [r.ljust(w) for r in TITLE_BITMAP] + [" " * w] * (h - len(TITLE_BITMAP))
-    lvl = lambda ch: 0 if ch == " " else int(ch)
-    lines = []
-    for y in range(0, h, 2):
-        out = []
-        for x in range(w):
-            a, b = lvl(bmp[y][x]), lvl(bmp[y + 1][x])
-            if not USE_COLOR:
-                out.append({(1, 1): "█", (1, 0): "▀", (0, 1): "▄"}.get((a >= 5, b >= 5), " "))
-            elif a == 0 and b == 0:
-                out.append("\033[0m ")
-            elif b == 0:
-                out.append("\033[0;38;2;%d;%d;%dm▀" % _title_rgb(a, y, h))
-            elif a == 0:
-                out.append("\033[0;38;2;%d;%d;%dm▄" % _title_rgb(b, y + 1, h))
-            else:
-                out.append("\033[0;38;2;%d;%d;%d;48;2;%d;%d;%dm▀"
-                           % (_title_rgb(a, y, h) + _title_rgb(b, y + 1, h)))
-        lines.append(("".join(out) + RESET).rstrip())
-    return lines
+  # If run from a file (a clone), remember its folder so local copies are used.
+  # When piped from curl there's no file, so everything is downloaded instead.
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    local_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  fi
 
+  printf '\n  %s◆  Network Drive installer%s\n' "$O$B" "$N"
 
-TITLE_FONT = "rowancap"   # figlet font, same as your login banner
-TITLE_COLOR = 208         # same color as your sed: \033[38;5;208m
+  # ── 0. Requirements ────────────────────────────────────────────────────────
+  if [ "$(id -u)" -ne 0 ]; then
+    if [ -n "$local_dir" ]; then
+      info "Needs root. Re-running with sudo…"
+      exec sudo bash "${BASH_SOURCE[0]}" "$@"
+    fi
+    die "Please run with sudo:  curl -fsSL ${REPO_RAW}/install.sh | sudo bash"
+  fi
+  command -v systemctl >/dev/null 2>&1 || die "systemd is required."
+  detect_package_manager
+  info "Package manager: ${PM}"
 
+  # ── 1. Packages ────────────────────────────────────────────────────────────
+  step "Packages"
+  local p missing=()
+  for p in "${PACKAGES[@]}"; do
+    if is_installed "$p"; then ok "$p ${D}(already installed)${N}"; else missing+=("$p"); fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    info "Installing: ${missing[*]}"
+    if ! install_packages "${missing[@]}"; then
+      [ "$PM" = dnf ] && info "On RHEL/Rocky/Alma, figlet and ntfs-3g need EPEL: sudo dnf install epel-release"
+      die "Could not install: ${missing[*]}"
+    fi
+    for p in "${missing[@]}"; do ok "$p ${D}(installed)${N}"; done
+  fi
 
-def figlet_title_lines(text):
-    """Title from figlet (like: figlet -f rowancap "$text"). None if figlet isn't available."""
-    try:
-        # -w 1000 stops figlet wrapping the title at its default 80 columns
-        r = run(["figlet", "-w", "1000", "-f", TITLE_FONT, text])
-    except OSError:
-        return None
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    lines = [l.rstrip() for l in r.stdout.splitlines()]
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
-    return [_c(f"38;5;{TITLE_COLOR}") + l + RESET for l in lines]
+  # ── 2. Title font ──────────────────────────────────────────────────────────
+  step "Title font (${FONT_NAME})"
+  local font_dir src="" url
+  font_dir="$(figlet_font_dir)"
+  mkdir -p "$font_dir"
+  info "figlet font folder: ${font_dir}"
 
+  if figlet -f "$FONT_NAME" test >/dev/null 2>&1; then
+    ok "${FONT_NAME} already installed"
+  else
+    if [ -n "$local_dir" ] && is_font "$local_dir/$FONT_FILE"; then
+      cp "$local_dir/$FONT_FILE" "$TMP/$FONT_FILE"; src="local copy"
+    else
+      for url in "${FONT_URLS[@]}"; do
+        if download "$url" "$TMP/$FONT_FILE" && is_font "$TMP/$FONT_FILE"; then
+          src="$url"; break
+        fi
+      done
+    fi
+    if [ -n "$src" ]; then
+      [ -z "$FONT_SHA256" ] && warn "Font fingerprint not set in install.sh, so the download wasn't verified."
+      # Fonts are plain data: owned by root, readable by everyone (644).
+      install -m 644 -o root -g root "$TMP/$FONT_FILE" "$font_dir/$FONT_FILE"
+      if figlet -f "$FONT_NAME" test >/dev/null 2>&1; then
+        ok "Installed ${font_dir}/${FONT_FILE} ${D}(from ${src})${N}"
+      else
+        warn "Font installed but figlet can't read it. The tool will use its built-in title."
+      fi
+    else
+      warn "Couldn't get a verified copy of ${FONT_NAME}. The tool still works and uses its built-in title."
+    fi
+  fi
 
-def big_title_lines(text):
-    fig = figlet_title_lines(text)
-    if fig:
-        return fig
-    # figlet or the font is missing: fall back to the built-in title.
-    if text.upper() == "NETWORK DRIVE":
-        return _smooth_title_lines()
-    # Any other title text falls back to the built-in pixel font.
-    pix = [""] * FONT_HEIGHT
-    for ch in text.upper():
-        glyph = FONT.get(ch, FONT[" "])
-        for y in range(FONT_HEIGHT):
-            pix[y] += glyph[y] + "." * LETTER_GAP
-    half = {("#", "#"): "█", ("#", "."): "▀", (".", "#"): "▄", (".", "."): " "}
-    rows = []
-    for y in range(0, FONT_HEIGHT, 2):
-        row = "".join(half[(a, b)] for a, b in zip(pix[y], pix[y + 1])).rstrip()
-        rows.append(_c(f"38;5;{TITLE_COLORS[y // 2]}") + row + RESET)
-    return rows
+  # ── 3. The tool ────────────────────────────────────────────────────────────
+  step "Installing ${APP_NAME}"
+  if [ -n "$local_dir" ] && [ -f "$local_dir/$SCRIPT_FILE" ]; then
+    cp "$local_dir/$SCRIPT_FILE" "$TMP/$SCRIPT_FILE"; src="local copy"
+  else
+    download "${REPO_RAW}/${SCRIPT_FILE}" "$TMP/$SCRIPT_FILE" \
+      || die "Couldn't download ${REPO_RAW}/${SCRIPT_FILE}"
+    src="GitHub"
+  fi
 
+  sed -i 's/\r$//' "$TMP/$SCRIPT_FILE"            # strip Windows line endings, just in case
+  python3 -m py_compile "$TMP/$SCRIPT_FILE" 2>/dev/null \
+    || die "${SCRIPT_FILE} has errors, so nothing was changed."
 
-def title_banner():
-    rows = big_title_lines(TITLE_TEXT)
-    width = max(vlen(r) for r in rows)
-    card = CARD_W + 4
-    if width > shutil.get_terminal_size((120, 24)).columns - 2:
-        # Terminal too narrow for the big letters: plain title instead.
-        print(f"\n  {ORANGE}{BOLD}{' '.join(TITLE_TEXT)}{RESET}")
-        return
-    indent = 2 + max(0, (card - width) // 2)   # centered over the cards
-    print()
-    for row in rows:
-        print(" " * indent + row)
+  # A symlink here would make "sudo samba-setup" run a file that may be editable
+  # without root (e.g. one in a home folder). Replace it with a real root-owned copy.
+  if [ -L "$INSTALL_PATH" ]; then
+    warn "${INSTALL_PATH} was a link to $(readlink "$INSTALL_PATH"). Replacing it with a root-owned copy."
+    rm -f "$INSTALL_PATH"
+  fi
 
+  if [ -f "$INSTALL_PATH" ] && cmp -s "$TMP/$SCRIPT_FILE" "$INSTALL_PATH"; then
+    ok "Already up to date ${D}(${INSTALL_PATH})${N}"
+  else
+    if [ -f "$INSTALL_PATH" ]; then
+      cp "$INSTALL_PATH" "${INSTALL_PATH}.bak"
+      info "Previous version saved as ${INSTALL_PATH}.bak"
+    fi
+    # root-owned, rwxr-xr-x: anyone can run it, only root can change it
+    install -m 755 -o root -g root "$TMP/$SCRIPT_FILE" "$INSTALL_PATH"
+    ok "Installed ${INSTALL_PATH} ${D}(from ${src}, root:root, 755)${N}"
+  fi
 
-def startup_screen():
-    # Scroll everything already on screen up into the scrollback (at least one full
-    # window's worth), then move the cursor to the top-left so the tool draws from the top.
-    rows = shutil.get_terminal_size((80, 24)).lines
-    sys.stdout.write("\n" * max(STARTUP_BLANK_LINES, rows))
-    if sys.stdout.isatty():
-        sys.stdout.write("\033[H")
-    sys.stdout.flush()
-    if STARTUP_DELAY:
-        import time
-        time.sleep(STARTUP_DELAY)
+  # ── 4. Samba ───────────────────────────────────────────────────────────────
+  step "Samba"
+  local smb_conf="/etc/samba/smb.conf" smb_svc nmb_svc
+  mkdir -p /etc/samba
+  if [ ! -f "$smb_conf" ]; then
+    # Some systems (e.g. Arch) ship no config at all: create a minimal one.
+    printf '[global]\n   workgroup = WORKGROUP\n   server string = Samba Server\n' > "$smb_conf"
+    chmod 644 "$smb_conf"
+    ok "Created ${smb_conf}"
+  fi
 
+  # Shares are password-protected by default (guest access is opt-in inside the tool).
+  # Also refuse connections from outside private networks, so a router mistake
+  # (like port-forwarding 445) can't expose the drives to the internet.
+  if grep -qiE '^[[:space:]]*hosts[[:space:]]+allow' "$smb_conf"; then
+    ok "Network restriction already set ${D}(hosts allow)${N}"
+  else
+    local allow="$SAMBA_HOSTS_ALLOW" pfx
+    # Home networks often use public IPv6 addresses; allow this server's own IPv6 networks too.
+    for pfx in $(ip -6 route show 2>/dev/null | awk '$1 ~ /\/[0-9]+$/ && $1 !~ /^fe80/ && $1 !~ /^ff/ {print $1}' | sort -u); do
+      allow="$allow $pfx"
+    done
+    cp "$smb_conf" "${smb_conf}.bak-$(date +%Y%m%d-%H%M%S)"
+    if grep -q '^\[global\]' "$smb_conf"; then
+      sed -i "/^\[global\]/a\\   # Added by Network Drive: only local networks and Tailscale may connect\n   hosts allow = ${allow}\n   hosts deny = ALL" "$smb_conf"
+    else
+      sed -i "1i [global]\n   hosts allow = ${allow}\n   hosts deny = ALL\n" "$smb_conf"
+    fi
+    ok "Samba only accepts local networks and Tailscale ${D}(hosts allow)${N}"
+  fi
 
-def banner_lines():
-    return ([f"{ORANGE}{BOLD}◆  Drive & Share Manager{RESET}", "",
-             f"{BOLD}{socket.gethostname()}{RESET}"] + ["  " + l for l in ip_lines(get_ips())])
+  if testparm -s "$smb_conf" >/dev/null 2>&1; then
+    ok "Samba config is valid"
+  else
+    warn "Samba reports a config problem. Check it with: testparm"
+  fi
 
+  # Service names differ: smbd/nmbd (Debian, Ubuntu) vs smb/nmb (Fedora, Arch, openSUSE).
+  if systemctl cat smbd.service >/dev/null 2>&1; then smb_svc=smbd; nmb_svc=nmbd; else smb_svc=smb; nmb_svc=nmb; fi
+  if systemctl enable --now "$smb_svc" >/dev/null 2>&1; then ok "${smb_svc} enabled and running"; else fail "Couldn't start ${smb_svc}"; fi
+  # nmb(d) helps Windows find the server by name; optional.
+  if systemctl cat "${nmb_svc}.service" >/dev/null 2>&1; then
+    if systemctl enable --now "$nmb_svc" >/dev/null 2>&1; then ok "${nmb_svc} enabled and running"; else warn "${nmb_svc} didn't start (optional)"; fi
+  fi
 
-MENU_LINES = [f"{CYAN}{BOLD}1{RESET}  Mount drives at boot",
-              f"{CYAN}{BOLD}2{RESET}  Share drives on the network",
-              f"{CYAN}{BOLD}3{RESET}  Show drives & shares",
-              f"{CYAN}{BOLD}4{RESET}  Settings",
-              f"{GRAY}q  Quit{RESET}"]
+  # Open the firewall for Samba (ufw on Ubuntu, firewalld on Fedora/openSUSE).
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw allow samba >/dev/null 2>&1; then ok "Firewall (ufw) allows Samba"; else warn "Couldn't add the ufw rule"; fi
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if firewall-cmd --permanent --add-service=samba >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then
+      ok "Firewall (firewalld) allows Samba"
+    else
+      warn "Couldn't add the firewalld rule"
+    fi
+  fi
 
+  # SELinux (Fedora/RHEL) blocks Samba from sharing folders unless allowed.
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+    if setsebool -P samba_export_all_rw on >/dev/null 2>&1; then ok "SELinux allows Samba shares"; else warn "Couldn't set SELinux samba_export_all_rw"; fi
+  fi
 
-# ───────────────────────────── settings ─────────────────────────────
-# Saved settings live outside the program, so updating or reinstalling the
-# tool never resets them. Simple "key = value" lines.
-SETTINGS_FILE = "/etc/network-drive/settings.conf"
+  # ── 5. Final check ─────────────────────────────────────────────────────────
+  step "Check"
+  local problems=0
+  chk() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else fail "$1"; problems=$((problems + 1)); fi; }
+  chk "python3"                 "command -v python3"
+  chk "figlet"                  "command -v figlet"
+  chk "${FONT_NAME} font"       "figlet -f $FONT_NAME test"
+  chk "lsblk / blkid"           "command -v lsblk && command -v blkid"
+  chk "NTFS support (ntfs-3g)"  "command -v ntfs-3g"
+  chk "Samba running"           "systemctl is-active --quiet $smb_svc"
+  chk "${APP_NAME} installed"   "[ -x $INSTALL_PATH ]"
+  chk "${APP_NAME} is valid"    "python3 -m py_compile $INSTALL_PATH"
 
+  echo
+  if [ "$problems" -eq 0 ]; then
+    printf '  %s✔ All set.%s Run it with:  %ssudo %s%s\n\n' "$G$B" "$N" "$B" "$APP_NAME" "$N"
+  else
+    printf '  %s%d item(s) need attention%s (see ✖ above). The font is optional; the rest is required.\n\n' \
+      "$Y$B" "$problems" "$N"
+  fi
+}
 
-def load_settings():
-    """Apply saved settings over the defaults above (missing/bad values are ignored)."""
-    global WARN_AT_PERCENT, SORT_DRIVES
-    try:
-        with open(SETTINGS_FILE) as f:
-            for line in f:
-                key, sep, value = line.partition("=")
-                if not sep or line.lstrip().startswith("#"):
-                    continue
-                key, value = key.strip(), value.strip()
-                if key == "warn_at_percent" and value.isdigit() and 1 <= int(value) <= 100:
-                    WARN_AT_PERCENT = int(value)
-                elif key == "sort_drives" and value in SORT_OPTIONS:
-                    SORT_DRIVES = value
-    except OSError:
-        pass
-
-
-def save_settings():
-    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-    with open(SETTINGS_FILE, "w") as f:
-        f.write("# Network Drive settings. Change them from the tool's Settings menu.\n")
-        f.write(f"warn_at_percent = {WARN_AT_PERCENT}\n")
-        f.write(f"sort_drives = {SORT_DRIVES}\n")
-    os.chmod(SETTINGS_FILE, 0o644)
-
-
-def _save_and_report(message):
-    try:
-        save_settings()
-        ok(f"{message} {GRAY}(saved to {SETTINGS_FILE}){RESET}")
-    except OSError as e:
-        fail(f"Couldn't save settings: {e}. The change lasts until you quit.")
-    print()
-    storage_panel()              # show the result right away
-
-
-def set_warning_level():
-    global WARN_AT_PERCENT
-    print(f"\n  {GRAY}Drives this full or fuller get a warning sign next to their percentage.{RESET}")
-    while True:
-        ans = ask("Warn when a drive reaches what percent? (1–100)", str(WARN_AT_PERCENT)).rstrip("%").strip()
-        if not ans.isdigit():
-            fail("Enter a whole number, like 85.")
-        elif not 1 <= int(ans) <= 100:
-            fail("Enter a number from 1 to 100.")
-        else:
-            break
-    old, WARN_AT_PERCENT = WARN_AT_PERCENT, int(ans)
-    _save_and_report(f"Warning set to {BOLD}{WARN_AT_PERCENT}%{RESET} {GRAY}(was {old}%){RESET}")
-
-
-def set_sort_order():
-    global SORT_DRIVES
-    keys = list(SORT_OPTIONS)
-    lines = []
-    for i, k in enumerate(keys, 1):
-        current = f"   {GREEN}● current{RESET}" if k == SORT_DRIVES else ""
-        lines.append(f"{CYAN}{BOLD}{i}{RESET}  {SORT_OPTIONS[k]}{current}")
-    lines.append(f"{GRAY}b  Back{RESET}")
-    print()
-    print(box(lines, title="Sort drives by"))
-    while True:
-        ans = ask("How should drives be ordered?").lower()
-        if ans in ("", "b", "back", "q"):
-            return
-        if ans.isdigit() and 1 <= int(ans) <= len(keys):
-            break
-        fail(f"Pick 1–{len(keys)} or b.")
-    SORT_DRIVES = keys[int(ans) - 1]
-    _save_and_report(f"Drives now sorted by {BOLD}{SORT_OPTIONS[SORT_DRIVES]}{RESET}")
-
-
-def settings_menu():
-    while True:
-        section("Settings")
-        print(box([f"{CYAN}{BOLD}1{RESET}  Drive-full warning level   "
-                   f"{_pct_color(WARN_AT_PERCENT / 100)}{WARN_AT_PERCENT}%{RESET}",
-                   f"{CYAN}{BOLD}2{RESET}  Sort drives by             {BOLD}{SORT_OPTIONS[SORT_DRIVES]}{RESET}",
-                   f"{GRAY}b  Back to menu{RESET}"], title="Settings"))
-        choice = ask("Choose a setting").lower()
-        if choice in ("", "b", "back", "q"):
-            return
-        if choice == "1":
-            set_warning_level()
-        elif choice == "2":
-            set_sort_order()
-        else:
-            fail("Pick 1, 2 or b.")
-
-
-def fit_cards():
-    """Size every card to the widest one (banner, storage, menu, drive table)."""
-    global CARD_W
-    blocks = [banner_lines(), MENU_LINES, storage_lines() or []]
-    try:
-        fu, ft = read_fstab()
-        blocks.append(drive_table_lines(get_drives(), fu, ft)[0])
-    except Exception:
-        pass
-    CARD_W = max([CARD_W] + [vlen(l) for b in blocks for l in b])
-    # Match the big title's width too, as long as the terminal is wide enough for it.
-    title_w = max(vlen(r) for r in big_title_lines(TITLE_TEXT))
-    if title_w <= shutil.get_terminal_size((120, 24)).columns - 2:
-        CARD_W = max(CARD_W, title_w - 4)
-
-
-def banner():
-    print()
-    print(box(banner_lines(), color=ORANGE))
-
-
-def main_menu():
-    load_settings()
-    fit_cards()
-    startup_screen()
-    title_banner()
-    banner()
-    actions = {"1": mount_drives, "2": setup_samba, "3": show_status, "4": settings_menu}
-    while True:
-        storage_panel()
-        print()
-        print(box(MENU_LINES, title="Menu"))
-        choice = ask("Choose an option").lower()
-        if choice in ("q", "quit", "exit"):
-            print(f"\n  {GRAY}Bye.{RESET}\n")
-            return
-        if choice in actions:
-            actions[choice]()
-        else:
-            fail("Pick 1, 2, 3, 4 or q.")
-
-
-if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print()
-        print(box([f"This tool changes system files, so it needs sudo.",
-                   f"Run: {BOLD}sudo {sys.argv[0]}{RESET}"], title="Permission needed", color=RED))
-        print()
-        sys.exit(1)
-    try:
-        main_menu()
-    except (KeyboardInterrupt, EOFError):
-        print(f"\n\n  {GRAY}Cancelled.{RESET}\n")
-        sys.exit(130)
+# Everything runs from main(), so the whole file is downloaded before anything
+# executes. A cut-off download can't run half a script.
+main "$@"
