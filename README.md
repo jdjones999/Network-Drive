@@ -1,6 +1,6 @@
 # Network Drive
 
-A terminal tool for Ubuntu/Debian servers that **mounts drives automatically at boot** and **shares them on your network with Samba**, all from a simple menu.
+A terminal tool for Linux servers (Ubuntu/Debian, Fedora, Arch, openSUSE) that **mounts drives automatically at boot** and **shares them on your network with Samba**, all from a simple menu.
 
 - Shows every data drive with a color storage gauge, and a ⚠ warning once a drive passes 85% full
 - Lists every address the server can be reached on (LAN, backup port, Tailscale)
@@ -27,9 +27,9 @@ sudo bash install.sh
 The installer:
 
 1. Installs what's needed: `python3`, `figlet`, `samba`, `ntfs-3g`, `curl`, and disk/network tools
-2. Installs the `rowancap` figlet font used for the title
+2. Downloads the `rowancap` figlet font from [figlet.org](http://www.figlet.org/fonts/rowancap.flf) and puts it in figlet's font folder for your system
 3. Installs the tool as `/usr/local/bin/samba-setup` (owner root, permissions 755)
-4. Enables and starts Samba, turns on guest access, and opens the firewall if `ufw` is on
+4. Sets up, enables and starts Samba, turns on guest access, and opens the firewall (`ufw` or `firewalld`), plus SELinux on Fedora/RHEL
 5. Checks everything and prints a ✔ / ✖ summary
 
 Running it again is safe. It updates the tool and skips anything already done.
@@ -67,7 +67,7 @@ Reinstalling replaces the installed copy (the old one is kept as `samba-setup.ba
 
 ## Requirements
 
-- Ubuntu or Debian with systemd
+- A systemd Linux with `apt` (Ubuntu/Debian), `dnf` (Fedora; RHEL-family needs EPEL), `pacman` (Arch) or `zypper` (openSUSE)
 - `sudo` access
 - A terminal with 24-bit color and Unicode, such as Windows Terminal. The title needs a window about 120 characters wide.
 
@@ -80,4 +80,4 @@ Reinstalling replaces the installed copy (the old one is kept as `samba-setup.ba
 
 [MIT](LICENSE) © 2026 jdjones999
 
-The `rowancap.flf` figlet font is a separate work by its original author and is included for convenience. It is not covered by this project's license.
+The `rowancap` figlet font is a separate work by its original author. The installer downloads it from figlet.org, and it is not covered by this project's license.
