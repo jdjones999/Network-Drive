@@ -12,11 +12,13 @@
 #      cd Network-Drive
 #      sudo bash install.sh
 #
+#  Works on: Ubuntu/Debian (apt), Fedora/RHEL (dnf), Arch (pacman), openSUSE (zypper)
+#
 #  What it does:
 #    1. Installs the packages the tool needs (python3, figlet, samba, ntfs-3g, …)
-#    2. Installs the "rowancap" figlet font used for the title
+#    2. Downloads the "rowancap" figlet font and puts it in figlet's font folder
 #    3. Installs the tool as /usr/local/bin/samba-setup (owner root, mode 755)
-#    4. Makes sure Samba is enabled, running, and allows guest shares
+#    4. Makes sure Samba is set up, enabled, running, and allows guest shares
 #    5. Checks everything and prints a summary
 #
 #  Safe to run again at any time: it updates the tool and skips what's done.
@@ -32,15 +34,20 @@ INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 
 FONT_NAME="rowancap"
 FONT_FILE="${FONT_NAME}.flf"
-# Font sources, tried in order. Your repo first; public copies as backup.
+# Font downloads, tried in order: the official FIGlet font archive first,
+# then backups (a copy in this repo, if present, and pyfiglet's copy).
 FONT_URLS=(
+  "http://www.figlet.org/fonts/${FONT_FILE}"
   "${REPO_RAW}/${FONT_FILE}"
-  "http://www.figlet.org/fonts/rowancap.flf"
-  "https://raw.githubusercontent.com/pwaller/pyfiglet/main/pyfiglet/fonts-contrib/rowancap.flf"
+  "https://raw.githubusercontent.com/pwaller/pyfiglet/main/pyfiglet/fonts-contrib/${FONT_FILE}"
 )
-
-# Packages the tool needs.
-APT_PACKAGES=(python3 figlet samba ntfs-3g util-linux iproute2 curl ca-certificates)
+# Where figlet keeps fonts on different systems (used only if figlet can't tell us).
+FONT_DIR_GUESSES=(
+  /usr/share/figlet            # Debian, Ubuntu, Fedora, Arch, openSUSE
+  /usr/share/figlet/fonts
+  /usr/local/share/figlet      # source installs, BSD
+  /usr/share/games/figlet
+)
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -56,11 +63,68 @@ warn() { printf '  %s!%s %s\n' "$Y" "$N" "$1"; }
 fail() { printf '  %s✖%s %s\n' "$R" "$N" "$1"; }
 die()  { fail "$1"; exit 1; }
 
-# Download a URL to a file. Returns non-zero on any failure (404, no network, …).
-download() { curl -fsSL --retry 2 --connect-timeout 10 "$1" -o "$2" 2>/dev/null; }
+# Download a URL to a file with curl (or wget). Non-zero on any failure.
+download() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 2 --connect-timeout 10 "$1" -o "$2" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --tries=2 --timeout=10 -O "$2" "$1" 2>/dev/null
+  else
+    return 1
+  fi
+}
 
 # True if the file is a real figlet font (they all start with "flf2a").
 is_font() { [ -s "$1" ] && head -c 5 "$1" | grep -q '^flf2a'; }
+
+# ── Package manager support ──────────────────────────────────────────────────
+# Sets PM and PACKAGES for this system.
+detect_package_manager() {
+  if   command -v apt-get >/dev/null 2>&1; then
+    PM=apt
+    PACKAGES=(python3 figlet samba ntfs-3g util-linux iproute2 curl ca-certificates)
+  elif command -v dnf >/dev/null 2>&1; then
+    PM=dnf
+    PACKAGES=(python3 figlet samba samba-common-tools ntfs-3g util-linux iproute curl ca-certificates)
+  elif command -v pacman >/dev/null 2>&1; then
+    PM=pacman
+    PACKAGES=(python figlet samba ntfs-3g util-linux iproute2 curl ca-certificates)
+  elif command -v zypper >/dev/null 2>&1; then
+    PM=zypper
+    PACKAGES=(python3 figlet samba ntfs-3g util-linux iproute2 curl ca-certificates)
+  else
+    die "Unsupported system: needs apt, dnf, pacman or zypper."
+  fi
+}
+
+is_installed() {   # is_installed PACKAGE
+  case "$PM" in
+    apt)        dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed" ;;
+    dnf|zypper) rpm -q "$1" >/dev/null 2>&1 ;;
+    pacman)     pacman -Q "$1" >/dev/null 2>&1 ;;
+  esac
+}
+
+install_packages() {   # install_packages PKG...  (</dev/null: can't eat a piped script)
+  case "$PM" in
+    apt)    export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq </dev/null && apt-get install -y -qq "$@" </dev/null >/dev/null ;;
+    dnf)    dnf install -y -q "$@" </dev/null >/dev/null ;;
+    pacman) pacman -Sy --needed --noconfirm "$@" </dev/null >/dev/null ;;
+    zypper) zypper --non-interactive --quiet install "$@" </dev/null >/dev/null ;;
+  esac
+}
+
+# figlet's font folder on this system.
+figlet_font_dir() {
+  local d
+  d="$(figlet -I2 2>/dev/null || true)"            # figlet reports its own folder
+  if [ -n "$d" ] && [ -d "$d" ]; then echo "$d"; return; fi
+  for d in "${FONT_DIR_GUESSES[@]}"; do             # otherwise find standard.flf
+    if [ -f "$d/standard.flf" ]; then echo "$d"; return; fi
+  done
+  echo /usr/share/figlet
+}
 
 main() {
   local local_dir=""
@@ -83,36 +147,34 @@ main() {
     fi
     die "Please run with sudo:  curl -fsSL ${REPO_RAW}/install.sh | sudo bash"
   fi
-  command -v apt-get   >/dev/null 2>&1 || die "This installer supports Debian/Ubuntu (apt) only."
   command -v systemctl >/dev/null 2>&1 || die "systemd is required."
+  detect_package_manager
+  info "Package manager: ${PM}"
 
   # ── 1. Packages ────────────────────────────────────────────────────────────
   step "Packages"
   local p missing=()
-  for p in "${APT_PACKAGES[@]}"; do
-    if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed"; then
-      ok "$p ${D}(already installed)${N}"
-    else
-      missing+=("$p")
-    fi
+  for p in "${PACKAGES[@]}"; do
+    if is_installed "$p"; then ok "$p ${D}(already installed)${N}"; else missing+=("$p"); fi
   done
   if [ "${#missing[@]}" -gt 0 ]; then
     info "Installing: ${missing[*]}"
-    export DEBIAN_FRONTEND=noninteractive
-    # </dev/null so apt can't swallow the rest of a piped script
-    apt-get update -qq </dev/null || die "apt-get update failed. Check your internet connection."
-    apt-get install -y -qq "${missing[@]}" </dev/null >/dev/null || die "Could not install: ${missing[*]}"
+    if ! install_packages "${missing[@]}"; then
+      [ "$PM" = dnf ] && info "On RHEL/Rocky/Alma, figlet and ntfs-3g need EPEL: sudo dnf install epel-release"
+      die "Could not install: ${missing[*]}"
+    fi
     for p in "${missing[@]}"; do ok "$p ${D}(installed)${N}"; done
   fi
 
   # ── 2. Title font ──────────────────────────────────────────────────────────
   step "Title font (${FONT_NAME})"
   local font_dir src="" url
-  font_dir="$(figlet -I2 2>/dev/null || echo /usr/share/figlet)"   # figlet's font folder
+  font_dir="$(figlet_font_dir)"
   mkdir -p "$font_dir"
+  info "figlet font folder: ${font_dir}"
 
   if figlet -f "$FONT_NAME" test >/dev/null 2>&1; then
-    ok "${FONT_NAME} already installed ${D}(${font_dir})${N}"
+    ok "${FONT_NAME} already installed"
   else
     if [ -n "$local_dir" ] && is_font "$local_dir/$FONT_FILE"; then
       cp "$local_dir/$FONT_FILE" "$TMP/$FONT_FILE"; src="local copy"
@@ -124,14 +186,15 @@ main() {
       done
     fi
     if [ -n "$src" ]; then
+      # Fonts are plain data: owned by root, readable by everyone (644).
       install -m 644 -o root -g root "$TMP/$FONT_FILE" "$font_dir/$FONT_FILE"
       if figlet -f "$FONT_NAME" test >/dev/null 2>&1; then
-        ok "Installed ${FONT_NAME} ${D}(from ${src})${N}"
+        ok "Installed ${font_dir}/${FONT_FILE} ${D}(from ${src})${N}"
       else
         warn "Font installed but figlet can't read it. The tool will use its built-in title."
       fi
     else
-      warn "Couldn't get ${FONT_NAME}. The tool still works and uses its built-in title."
+      warn "Couldn't download ${FONT_NAME}. The tool still works and uses its built-in title."
     fi
   fi
 
@@ -163,15 +226,25 @@ main() {
 
   # ── 4. Samba ───────────────────────────────────────────────────────────────
   step "Samba"
-  local smb_conf="/etc/samba/smb.conf"
-  [ -f "$smb_conf" ] || die "${smb_conf} is missing even though Samba is installed."
+  local smb_conf="/etc/samba/smb.conf" smb_svc nmb_svc
+  mkdir -p /etc/samba
+  if [ ! -f "$smb_conf" ]; then
+    # Some systems (e.g. Arch) ship no config at all: create a minimal one.
+    printf '[global]\n   workgroup = WORKGROUP\n   server string = Samba Server\n   map to guest = bad user\n' > "$smb_conf"
+    chmod 644 "$smb_conf"
+    ok "Created ${smb_conf}"
+  fi
 
   # Guest (no-password) shares need "map to guest = bad user" in [global].
   if grep -qiE '^[[:space:]]*map[[:space:]]+to[[:space:]]+guest' "$smb_conf"; then
-    ok "Guest access already enabled"
+    ok "Guest access enabled"
   else
     cp "$smb_conf" "${smb_conf}.bak-$(date +%Y%m%d-%H%M%S)"
-    sed -i '/^\[global\]/a\   map to guest = bad user' "$smb_conf"
+    if grep -q '^\[global\]' "$smb_conf"; then
+      sed -i '/^\[global\]/a\   map to guest = bad user' "$smb_conf"
+    else
+      sed -i '1i [global]\n   map to guest = bad user\n' "$smb_conf"
+    fi
     ok "Enabled guest access ${D}(map to guest = bad user)${N}"
   fi
 
@@ -181,14 +254,28 @@ main() {
     warn "Samba reports a config problem. Check it with: testparm"
   fi
 
-  if systemctl enable --now smbd >/dev/null 2>&1; then ok "smbd enabled and running"; else fail "Couldn't start smbd"; fi
-  # nmbd helps Windows find the server by name; not every system has it.
-  if systemctl cat nmbd.service >/dev/null 2>&1; then
-    if systemctl enable --now nmbd >/dev/null 2>&1; then ok "nmbd enabled and running"; else warn "nmbd didn't start (optional)"; fi
+  # Service names differ: smbd/nmbd (Debian, Ubuntu) vs smb/nmb (Fedora, Arch, openSUSE).
+  if systemctl cat smbd.service >/dev/null 2>&1; then smb_svc=smbd; nmb_svc=nmbd; else smb_svc=smb; nmb_svc=nmb; fi
+  if systemctl enable --now "$smb_svc" >/dev/null 2>&1; then ok "${smb_svc} enabled and running"; else fail "Couldn't start ${smb_svc}"; fi
+  # nmb(d) helps Windows find the server by name; optional.
+  if systemctl cat "${nmb_svc}.service" >/dev/null 2>&1; then
+    if systemctl enable --now "$nmb_svc" >/dev/null 2>&1; then ok "${nmb_svc} enabled and running"; else warn "${nmb_svc} didn't start (optional)"; fi
   fi
-  # Open the firewall for Samba if ufw is turned on.
+
+  # Open the firewall for Samba (ufw on Ubuntu, firewalld on Fedora/openSUSE).
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     if ufw allow samba >/dev/null 2>&1; then ok "Firewall (ufw) allows Samba"; else warn "Couldn't add the ufw rule"; fi
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if firewall-cmd --permanent --add-service=samba >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then
+      ok "Firewall (firewalld) allows Samba"
+    else
+      warn "Couldn't add the firewalld rule"
+    fi
+  fi
+
+  # SELinux (Fedora/RHEL) blocks Samba from sharing folders unless allowed.
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+    if setsebool -P samba_export_all_rw on >/dev/null 2>&1; then ok "SELinux allows Samba shares"; else warn "Couldn't set SELinux samba_export_all_rw"; fi
   fi
 
   # ── 5. Final check ─────────────────────────────────────────────────────────
@@ -200,7 +287,7 @@ main() {
   chk "${FONT_NAME} font"       "figlet -f $FONT_NAME test"
   chk "lsblk / blkid"           "command -v lsblk && command -v blkid"
   chk "NTFS support (ntfs-3g)"  "command -v ntfs-3g"
-  chk "Samba running"           "systemctl is-active --quiet smbd"
+  chk "Samba running"           "systemctl is-active --quiet $smb_svc"
   chk "${APP_NAME} installed"   "[ -x $INSTALL_PATH ]"
   chk "${APP_NAME} is valid"    "python3 -m py_compile $INSTALL_PATH"
 
