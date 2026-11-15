@@ -5,7 +5,7 @@ A terminal tool for Linux servers (Ubuntu/Debian, Fedora, Arch, openSUSE) that *
 - Shows every data drive with a color storage gauge, and a ⚠ warning once a drive passes 85% full
 - Lists every address the server can be reached on (LAN, backup port, Tailscale)
 - Mounts new drives safely: backs up `/etc/fstab` first, and uses `nofail` so a missing drive never stops the server from booting
-- Shares drives as guest (no-password) Samba shares and shows the exact `\\address\share` path to use from Windows
+- Shares drives with **password protection by default** (guest access only if you choose it) and shows the exact `\\address\share` path to use from Windows
 - Skips system partitions (`/boot`, LVM, swap) so they can't be mounted or shared by mistake
 
 ## Install
@@ -29,7 +29,7 @@ The installer:
 1. Installs what's needed: `python3`, `figlet`, `samba`, `ntfs-3g`, `curl`, and disk/network tools
 2. Downloads the `rowancap` figlet font from [figlet.org](http://www.figlet.org/fonts/rowancap.flf) and puts it in figlet's font folder for your system
 3. Installs the tool as `/usr/local/bin/samba-setup` (owner root, permissions 755)
-4. Sets up, enables and starts Samba, turns on guest access, and opens the firewall (`ufw` or `firewalld`), plus SELinux on Fedora/RHEL
+4. Sets up, enables and starts Samba, **limits it to local networks and Tailscale**, and opens the firewall (`ufw` or `firewalld`), plus SELinux on Fedora/RHEL
 5. Checks everything and prints a ✔ / ✖ summary
 
 Running it again is safe. It updates the tool and skips anything already done.
@@ -43,7 +43,7 @@ sudo samba-setup
 | Option | What it does |
 |---|---|
 | **1** Mount drives at boot | Pick a drive, name its folder under `/mnt`, and it's added to `/etc/fstab` and mounted |
-| **2** Share drives on the network | Pick a mounted drive and it becomes a Samba share |
+| **2** Share drives on the network | Pick a mounted drive and it becomes a Samba share, password-protected by default |
 | **3** Show drives & shares | Overview only. Changes nothing |
 | **4** Settings | Set the drive-full warning percentage and the order drives are listed in: name, fullness or capacity (saved in `/etc/network-drive/settings.conf`) |
 
@@ -73,10 +73,13 @@ Reinstalling replaces the installed copy (the old one is kept as `samba-setup.ba
 - `sudo` access
 - A terminal with 24-bit color and Unicode, such as Windows Terminal. The title needs a window about 120 characters wide.
 
-## Safety notes
+## Security
 
-- Shares are **guest-accessible with write access**: anyone on your network can read and change files in them. Only use this on a network you trust.
-- Every change to `/etc/fstab` and `/etc/samba/smb.conf` is backed up first with a timestamp (for example `/etc/fstab.bak-20261115-134500`).
+- **Password-protected shares by default.** When you share a drive, you choose which account may connect, and it gets a Samba password. Guest (no-password) sharing is available but must be confirmed, because anyone on your network, including malware on another computer, could then read, change and delete everything on that drive. Guest shares show as **● guest** in yellow.
+- **Local networks only.** The installer limits Samba to this machine, private home/office networks, your server's own IPv6 network and Tailscale (`hosts allow` in `/etc/samba/smb.conf`). Even if a router is misconfigured, connections from the internet are refused. Never port-forward 445/139 on your router; use Tailscale or a VPN for remote access.
+- **Verified downloads.** The title font is only installed if it matches the SHA-256 fingerprint in `install.sh`. The tool installs root-owned (`755`) in `/usr/local/bin`, and the installer replaces any symlink there with a real copy.
+- **Backups.** Every change to `/etc/fstab` and `/etc/samba/smb.conf` is backed up first with a timestamp (for example `/etc/fstab.bak-20261115-134500`).
+- **Installing with `curl | sudo bash`** runs this repo's code as root. Read `install.sh` first if you like. It's short and commented.
 
 ## License
 
