@@ -18,7 +18,7 @@
 #    1. Installs the packages the tool needs (python3, figlet, samba, ntfs-3g, …)
 #    2. Downloads the "rowancap" figlet font and puts it in figlet's font folder
 #    3. Installs the tool as /usr/local/bin/samba-setup (owner root, mode 755)
-#    4. Makes sure Samba is set up, enabled, running, and allows guest shares
+#    4. Sets up Samba (enabled, running, and only reachable from local networks/Tailscale)
 #    5. Checks everything and prints a summary
 #
 #  Safe to run again at any time: it updates the tool and skips what's done.
@@ -41,6 +41,16 @@ FONT_URLS=(
   "${REPO_RAW}/${FONT_FILE}"
   "https://raw.githubusercontent.com/pwaller/pyfiglet/main/pyfiglet/fonts-contrib/${FONT_FILE}"
 )
+# SHA-256 fingerprint of the genuine rowancap.flf. A download is only installed if
+# it matches, so a tampered file (e.g. swapped on the way over plain http) is rejected.
+# Get it once on a machine where the font already works:  sha256sum "$(figlet -I2)/rowancap.flf"
+# Leave empty to skip the check (not recommended).
+FONT_SHA256=""
+
+# Only these networks may connect to Samba: this machine, private home/office
+# ranges, and Tailscale. Everything else (the internet) is refused.
+SAMBA_HOSTS_ALLOW="127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10"
+
 # Where figlet keeps fonts on different systems (used only if figlet can't tell us).
 FONT_DIR_GUESSES=(
   /usr/share/figlet            # Debian, Ubuntu, Fedora, Arch, openSUSE
@@ -74,8 +84,14 @@ download() {
   fi
 }
 
-# True if the file is a real figlet font (they all start with "flf2a").
-is_font() { [ -s "$1" ] && head -c 5 "$1" | grep -q '^flf2a'; }
+# True if the file is a real figlet font (they all start with "flf2a") and,
+# when FONT_SHA256 is set, matches that fingerprint exactly.
+is_font() {
+  [ -s "$1" ] && head -c 5 "$1" | grep -q '^flf2a' || return 1
+  if [ -n "$FONT_SHA256" ]; then
+    [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$FONT_SHA256" ] || return 1
+  fi
+}
 
 # ── Package manager support ──────────────────────────────────────────────────
 # Sets PM and PACKAGES for this system.
@@ -186,6 +202,7 @@ main() {
       done
     fi
     if [ -n "$src" ]; then
+      [ -z "$FONT_SHA256" ] && warn "Font fingerprint not set in install.sh, so the download wasn't verified."
       # Fonts are plain data: owned by root, readable by everyone (644).
       install -m 644 -o root -g root "$TMP/$FONT_FILE" "$font_dir/$FONT_FILE"
       if figlet -f "$FONT_NAME" test >/dev/null 2>&1; then
@@ -194,7 +211,7 @@ main() {
         warn "Font installed but figlet can't read it. The tool will use its built-in title."
       fi
     else
-      warn "Couldn't download ${FONT_NAME}. The tool still works and uses its built-in title."
+      warn "Couldn't get a verified copy of ${FONT_NAME}. The tool still works and uses its built-in title."
     fi
   fi
 
@@ -211,6 +228,13 @@ main() {
   sed -i 's/\r$//' "$TMP/$SCRIPT_FILE"            # strip Windows line endings, just in case
   python3 -m py_compile "$TMP/$SCRIPT_FILE" 2>/dev/null \
     || die "${SCRIPT_FILE} has errors, so nothing was changed."
+
+  # A symlink here would make "sudo samba-setup" run a file that may be editable
+  # without root (e.g. one in a home folder). Replace it with a real root-owned copy.
+  if [ -L "$INSTALL_PATH" ]; then
+    warn "${INSTALL_PATH} was a link to $(readlink "$INSTALL_PATH"). Replacing it with a root-owned copy."
+    rm -f "$INSTALL_PATH"
+  fi
 
   if [ -f "$INSTALL_PATH" ] && cmp -s "$TMP/$SCRIPT_FILE" "$INSTALL_PATH"; then
     ok "Already up to date ${D}(${INSTALL_PATH})${N}"
@@ -230,22 +254,29 @@ main() {
   mkdir -p /etc/samba
   if [ ! -f "$smb_conf" ]; then
     # Some systems (e.g. Arch) ship no config at all: create a minimal one.
-    printf '[global]\n   workgroup = WORKGROUP\n   server string = Samba Server\n   map to guest = bad user\n' > "$smb_conf"
+    printf '[global]\n   workgroup = WORKGROUP\n   server string = Samba Server\n' > "$smb_conf"
     chmod 644 "$smb_conf"
     ok "Created ${smb_conf}"
   fi
 
-  # Guest (no-password) shares need "map to guest = bad user" in [global].
-  if grep -qiE '^[[:space:]]*map[[:space:]]+to[[:space:]]+guest' "$smb_conf"; then
-    ok "Guest access enabled"
+  # Shares are password-protected by default (guest access is opt-in inside the tool).
+  # Also refuse connections from outside private networks, so a router mistake
+  # (like port-forwarding 445) can't expose the drives to the internet.
+  if grep -qiE '^[[:space:]]*hosts[[:space:]]+allow' "$smb_conf"; then
+    ok "Network restriction already set ${D}(hosts allow)${N}"
   else
+    local allow="$SAMBA_HOSTS_ALLOW" pfx
+    # Home networks often use public IPv6 addresses; allow this server's own IPv6 networks too.
+    for pfx in $(ip -6 route show 2>/dev/null | awk '$1 ~ /\/[0-9]+$/ && $1 !~ /^fe80/ && $1 !~ /^ff/ {print $1}' | sort -u); do
+      allow="$allow $pfx"
+    done
     cp "$smb_conf" "${smb_conf}.bak-$(date +%Y%m%d-%H%M%S)"
     if grep -q '^\[global\]' "$smb_conf"; then
-      sed -i '/^\[global\]/a\   map to guest = bad user' "$smb_conf"
+      sed -i "/^\[global\]/a\\   # Added by Network Drive: only local networks and Tailscale may connect\n   hosts allow = ${allow}\n   hosts deny = ALL" "$smb_conf"
     else
-      sed -i '1i [global]\n   map to guest = bad user\n' "$smb_conf"
+      sed -i "1i [global]\n   hosts allow = ${allow}\n   hosts deny = ALL\n" "$smb_conf"
     fi
-    ok "Enabled guest access ${D}(map to guest = bad user)${N}"
+    ok "Samba only accepts local networks and Tailscale ${D}(hosts allow)${N}"
   fi
 
   if testparm -s "$smb_conf" >/dev/null 2>&1; then
