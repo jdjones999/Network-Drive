@@ -363,6 +363,14 @@ def preview(mount_point, limit=12):
 
 # ───────────────────────────── actions ─────────────────────────────
 
+def samba_service():
+    """Samba's service name: smbd on Debian/Ubuntu, smb on Fedora/openSUSE/Arch."""
+    for name in ("smbd", "smb"):
+        if run(["systemctl", "cat", f"{name}.service"]).returncode == 0:
+            return name
+    return "smbd"
+
+
 def sanitize(name):
     return re.sub(r"[^\w-]", "", (name or "").replace(" ", "-")).strip("-")
 
@@ -452,7 +460,7 @@ def mount_drives():
 def setup_samba():
     section("Share drives on the network")
     if not os.path.exists(SMB_CONF):
-        fail("Samba isn't installed. Install it with: sudo apt install samba")
+        fail("Samba isn't installed. Run the Network Drive installer again to set it up.")
         return
 
     fstab_uuids, _ = read_fstab()
@@ -503,7 +511,7 @@ def setup_samba():
     if run(["testparm", "-s"]).returncode != 0:
         warn(f"Samba reports a config problem. Check it with: {BOLD}testparm{RESET}")
 
-    r = run(["systemctl", "restart", "smbd"])
+    r = run(["systemctl", "restart", samba_service()])
     if r.returncode != 0:
         fail(f"Samba didn't restart: {r.stderr.strip()}")
         return
