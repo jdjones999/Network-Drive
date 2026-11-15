@@ -631,9 +631,11 @@ def storage_lines(bar_width=24):
             rows.append([f"{GRAY}{name}{RESET}", f"{GRAY}not mounted{RESET}", "", "", net])
             continue
         frac = u.used / u.total if u.total else 0
-        # ⚠ marks drives at or above WARN_AT_PERCENT. Plain U+26A0 stays one column wide.
+        # ⚠ marks drives at or above WARN_AT_PERCENT. Some terminals (Windows Terminal)
+        # draw ⚠ two columns wide, so it always gets a spare space after it to spill into.
         warn_mark = "⚠" if USE_COLOR else "!"
-        pct = f"{_pct_color(frac)}{frac * 100:.0f}%{warn_mark if frac * 100 >= WARN_AT_PERCENT else ' '}{RESET}"
+        mark = warn_mark if frac * 100 >= WARN_AT_PERCENT else " "
+        pct = f"{_pct_color(frac)}{frac * 100:.0f}%{mark} {RESET}"
         rows.append([f"{BOLD}{name}{RESET}", usage_bar(frac, bar_width), pct,
                      f"{human(u.used)} {GRAY}/{RESET} {human(u.total)}", net])
     return table(["Drive", "Usage", "", "Used / Size", "Network"], rows,
@@ -865,7 +867,7 @@ def settings_menu():
     global WARN_AT_PERCENT
     while True:
         section("Settings")
-        print(box([f"{CYAN}{BOLD}1{RESET}  Drive-full warning (⚠)   "
+        print(box([f"{CYAN}{BOLD}1{RESET}  Drive-full warning level   "
                    f"{_pct_color(WARN_AT_PERCENT / 100)}{WARN_AT_PERCENT}%{RESET}",
                    f"{GRAY}b  Back to menu{RESET}"], title="Settings"))
         choice = ask("Choose a setting").lower()
@@ -875,7 +877,7 @@ def settings_menu():
             fail("Pick 1 or b.")
             continue
 
-        print(f"\n  {GRAY}A ⚠ appears next to any drive that is this full or fuller.{RESET}")
+        print(f"\n  {GRAY}Drives this full or fuller get a warning sign next to their percentage.{RESET}")
         while True:
             ans = ask("Warn when a drive reaches what percent? (1–100)", str(WARN_AT_PERCENT)).rstrip("%").strip()
             try:
