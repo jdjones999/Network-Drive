@@ -45,6 +45,7 @@ sudo samba-setup
 | **1** Mount drives at boot | Pick a drive, name its folder under `/mnt`, and it's added to `/etc/fstab` and mounted |
 | **2** Share drives on the network | Pick a mounted drive and it becomes a Samba share |
 | **3** Show drives & shares | Overview only. Changes nothing |
+| **4** Settings | Set the drive-full warning percentage and the order drives are listed in: name, fullness or capacity (saved in `/etc/network-drive/settings.conf`) |
 
 From Windows, open File Explorer and type the share address shown, for example `\\192.168.0.3\FreeAgent`.
 
@@ -59,7 +60,8 @@ Open `/usr/local/bin/samba-setup` (or `samba-setup.py` in this repo) and change 
 | `TITLE_COLOR` | `208` | Title color (xterm-256 color number) |
 | `STARTUP_BLANK_LINES` | `75` | Blank lines printed on start (keeps your scrollback) |
 | `STARTUP_DELAY` | `0` | Seconds to pause on start |
-| `WARN_AT_PERCENT` | `85` | When ⚠ appears next to a drive |
+| `WARN_AT_PERCENT` | `85` | When ⚠ appears next to a drive. Easier: change it from **4 Settings** in the menu |
+| `SORT_DRIVES` | `"name"` | Drive order: `name`, `usage` (least → most full) or `capacity` (smallest → largest). Also in **4 Settings** |
 | `BAR_STYLE` | `"grid"` | `grid`, `lines`, `gaps`, or `blocks` |
 | `TERMINAL_BG` | `(12, 12, 12)` | Your terminal's background color, used for the gaps in the bars |
 
