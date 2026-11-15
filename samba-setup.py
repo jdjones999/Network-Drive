@@ -528,6 +528,7 @@ def setup_samba():
 
 
 # Show ⚠ next to a drive's percentage once it's this full (or fuller).
+# This is the default; change it from the menu: 4 Settings (saved in /etc/network-drive/settings.conf).
 WARN_AT_PERCENT = 85
 
 # Storage bar style:
@@ -825,7 +826,76 @@ def banner_lines():
 MENU_LINES = [f"{CYAN}{BOLD}1{RESET}  Mount drives at boot",
               f"{CYAN}{BOLD}2{RESET}  Share drives on the network",
               f"{CYAN}{BOLD}3{RESET}  Show drives & shares",
+              f"{CYAN}{BOLD}4{RESET}  Settings",
               f"{GRAY}q  Quit{RESET}"]
+
+
+# ───────────────────────────── settings ─────────────────────────────
+# Saved settings live outside the program, so updating or reinstalling the
+# tool never resets them. Simple "key = value" lines.
+SETTINGS_FILE = "/etc/network-drive/settings.conf"
+
+
+def load_settings():
+    """Apply saved settings over the defaults above (missing/bad values are ignored)."""
+    global WARN_AT_PERCENT
+    try:
+        with open(SETTINGS_FILE) as f:
+            for line in f:
+                key, sep, value = line.partition("=")
+                if not sep or line.lstrip().startswith("#"):
+                    continue
+                if key.strip() == "warn_at_percent":
+                    n = int(value.strip())
+                    if 1 <= n <= 100:
+                        WARN_AT_PERCENT = n
+    except (OSError, ValueError):
+        pass
+
+
+def save_settings():
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+    with open(SETTINGS_FILE, "w") as f:
+        f.write("# Network Drive settings. Change them from the tool's Settings menu.\n")
+        f.write(f"warn_at_percent = {WARN_AT_PERCENT}\n")
+    os.chmod(SETTINGS_FILE, 0o644)
+
+
+def settings_menu():
+    global WARN_AT_PERCENT
+    while True:
+        section("Settings")
+        print(box([f"{CYAN}{BOLD}1{RESET}  Drive-full warning (⚠)   "
+                   f"{_pct_color(WARN_AT_PERCENT / 100)}{WARN_AT_PERCENT}%{RESET}",
+                   f"{GRAY}b  Back to menu{RESET}"], title="Settings"))
+        choice = ask("Choose a setting").lower()
+        if choice in ("", "b", "back", "q"):
+            return
+        if choice != "1":
+            fail("Pick 1 or b.")
+            continue
+
+        print(f"\n  {GRAY}A ⚠ appears next to any drive that is this full or fuller.{RESET}")
+        while True:
+            ans = ask("Warn when a drive reaches what percent? (1–100)", str(WARN_AT_PERCENT)).rstrip("%").strip()
+            try:
+                n = int(ans)
+            except ValueError:
+                fail("Enter a whole number, like 85.")
+                continue
+            if not 1 <= n <= 100:
+                fail("Enter a number from 1 to 100.")
+                continue
+            break
+
+        old, WARN_AT_PERCENT = WARN_AT_PERCENT, n
+        try:
+            save_settings()
+            ok(f"Warning set to {BOLD}{n}%{RESET} {GRAY}(was {old}%, saved to {SETTINGS_FILE}){RESET}")
+        except OSError as e:
+            fail(f"Couldn't save settings: {e}. Using {n}% until you quit.")
+        print()
+        storage_panel()          # show the result right away
 
 
 def fit_cards():
@@ -850,11 +920,12 @@ def banner():
 
 
 def main_menu():
+    load_settings()
     fit_cards()
     startup_screen()
     title_banner()
     banner()
-    actions = {"1": mount_drives, "2": setup_samba, "3": show_status}
+    actions = {"1": mount_drives, "2": setup_samba, "3": show_status, "4": settings_menu}
     while True:
         storage_panel()
         print()
@@ -866,7 +937,7 @@ def main_menu():
         if choice in actions:
             actions[choice]()
         else:
-            fail("Pick 1, 2, 3 or q.")
+            fail("Pick 1, 2, 3, 4 or q.")
 
 
 if __name__ == "__main__":
